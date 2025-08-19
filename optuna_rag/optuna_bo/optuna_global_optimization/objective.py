@@ -9,7 +9,7 @@ import time
 
 class OptunaObjective:
     def __init__(self, search_space, config_generator, pipeline_runner, 
-                 component_cache, corpus_df, qa_df, use_cache=True, search_type='grid', result_dir=None, save_intermediate_results=True):
+                 component_cache, corpus_df, qa_df, use_cache=True, result_dir=None, save_intermediate_results=True):
         self.search_space = search_space
         self.config_generator = config_generator
         self.pipeline_runner = pipeline_runner
@@ -17,16 +17,13 @@ class OptunaObjective:
         self.corpus_df = corpus_df
         self.qa_df = qa_df
         self.use_cache = use_cache
-        self.search_type = search_type
         self.cached_pipeline_runner = None
         self.result_dir = result_dir or "optuna_results"
         self.save_intermediate_results = save_intermediate_results
         
         self.has_query_expansion = self.config_generator.node_exists("query_expansion")
         self.has_retrieval = self.config_generator.node_exists("retrieval")
-        
-        if self.search_type == 'grid' and self.has_query_expansion:
-            self._precompute_valid_param_combinations()
+
     
     def _precompute_valid_param_combinations(self):
         self.valid_param_combinations = []
@@ -206,16 +203,8 @@ class OptunaObjective:
     
     
     def __call__(self, trial: optuna.Trial) -> float:
-        if self.search_type == 'grid' and self.has_query_expansion:
-            if trial.number < len(self.valid_param_combinations):
-                params = self.valid_param_combinations[trial.number].copy()
-                for key, value in params.items():
-                    trial._cached_frozen_trial.distributions[key] = optuna.distributions.CategoricalDistribution([value])
-                    trial._cached_frozen_trial.params[key] = value
-            else:
-                return 0.0
-        else:
-            params = self._suggest_params(trial)
+
+        params = self._suggest_params(trial)
         
         self._clean_params(params)
         
@@ -321,13 +310,10 @@ class OptunaObjective:
         if isinstance(param_spec, list):
             return trial.suggest_categorical(param_name, param_spec)
         elif isinstance(param_spec, tuple) and len(param_spec) == 2:
-            if self.search_type == 'grid':
-                return trial.suggest_categorical(param_name, list(param_spec))
+            if param_type == 'int':
+                return trial.suggest_int(param_name, param_spec[0], param_spec[1])
             else:
-                if param_type == 'int':
-                    return trial.suggest_int(param_name, param_spec[0], param_spec[1])
-                else:
-                    return trial.suggest_float(param_name, param_spec[0], param_spec[1])
+                return trial.suggest_float(param_name, param_spec[0], param_spec[1])
         else:
             raise ValueError(f"Invalid parameter specification for {param_name}: {param_spec}")
     
@@ -481,7 +467,7 @@ class OptunaObjective:
             print(f"  Auto-setting filter to 'pass' because reranker_top_k=1")
             return
         
-        if self.search_type == 'bo' and 'passage_filter_method' in self.search_space:
+        if 'passage_filter_method' in self.search_space:
             params['passage_filter_method'] = trial.suggest_categorical(
                 'passage_filter_method', 
                 self.search_space['passage_filter_method']
@@ -564,7 +550,7 @@ class OptunaObjective:
                                                                 self.search_space['reranker_config'])
             
             if 'reranker_top_k' in self.search_space:
-                if self.search_type == 'bo' and 'retriever_top_k' in params:
+                if 'retriever_top_k' in params:
                     reranker_range = self.search_space['reranker_top_k']
                     if isinstance(reranker_range, tuple):
                         max_reranker_k = min(reranker_range[1], params['retriever_top_k'])
@@ -614,7 +600,7 @@ class OptunaObjective:
                                                                     self.search_space[model_key])
             
         if 'reranker_top_k' in self.search_space:
-            if self.search_type == 'bo' and 'retriever_top_k' in params:
+            if 'retriever_top_k' in params:
                 reranker_range = self.search_space['reranker_top_k']
                 if isinstance(reranker_range, tuple):
                     max_reranker_k = min(reranker_range[1], params['retriever_top_k'])

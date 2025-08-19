@@ -396,7 +396,6 @@ class BOPipelineOptimizer:
                 corpus_df=self.corpus_df,
                 qa_df=self.qa_df,
                 use_cache=False,
-                search_type='bo'
             )
 
             score = objective_instance(trial)

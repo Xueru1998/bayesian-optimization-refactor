@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.config_manager import ConfigGenerator
 from pipeline.search_space_calculator import CombinationCalculator
+from pipeline.pipeline_executor import RAGPipelineExecutor
 
 
 class ComponentwiseRAGProcessor:
@@ -70,16 +71,8 @@ class ComponentwiseRAGProcessor:
         is_pass_component = False
         
         if component == 'retrieval' and 'retrieval_config' in trial_config:
-            retrieval_config_str = trial_config['retrieval_config']
-            if retrieval_config_str.startswith('bm25_'):
-                tokenizer = retrieval_config_str.replace('bm25_', '')
-                trial_config['retrieval_method'] = 'bm25'
-                trial_config['bm25_tokenizer'] = tokenizer
-            elif retrieval_config_str.startswith('vectordb_'):
-                vdb_name = retrieval_config_str.replace('vectordb_', '')
-                trial_config['retrieval_method'] = 'vectordb'
-                trial_config['vectordb_name'] = vdb_name
-            
+            parsed = RAGPipelineExecutor.parse_retrieval_config(trial_config['retrieval_config'])
+            trial_config.update(parsed)
             trial_config.pop('retrieval_config', None)
         
         elif component == 'query_expansion' and 'query_expansion_config' in trial_config:
@@ -106,6 +99,9 @@ class ComponentwiseRAGProcessor:
                             if gen_type == 'sap_api':
                                 trial_config['query_expansion_api_url'] = gen_config.get('api_url')
                             break
+                else:
+                    parsed = RAGPipelineExecutor.parse_query_expansion_config(qe_config_str)
+                    trial_config.update(parsed)
             
             trial_config.pop('query_expansion_config', None)
         
@@ -133,7 +129,8 @@ class ComponentwiseRAGProcessor:
                 trial_config['passage_reranker_method'] = parts[0]
                 trial_config['reranker_model_name'] = parts[1]
             else:
-                trial_config['passage_reranker_method'] = reranker_config_str
+                parsed = RAGPipelineExecutor.parse_reranker_config(reranker_config_str)
+                trial_config.update(parsed)
             
             trial_config.pop('reranker_config', None)
         
@@ -164,7 +161,7 @@ class ComponentwiseRAGProcessor:
                         if len(parts) > 1:
                             trial_config['spacy_model'] = parts[1]
                         elif 'spacy_model' in trial_config:
-                            pass  
+                            pass
                             
                 elif len(parts) == 3:
                     method, gen_type, model = parts
@@ -214,6 +211,9 @@ class ComponentwiseRAGProcessor:
                                 if comp_config.get('generator_module_type') == 'sap_api':
                                     trial_config['compressor_api_url'] = comp_config.get('api_url')
                                 break
+                else:
+                    parsed = RAGPipelineExecutor.parse_compressor_config(comp_config_str)
+                    trial_config.update(parsed)
             
             trial_config.pop('passage_compressor_config', None)
             
@@ -265,7 +265,7 @@ class ComponentwiseRAGProcessor:
             filter_config_str = trial_config['passage_filter_config']
             if filter_config_str == 'pass_passage_filter':
                 is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_filter_config(filter_config_str)
+            parsed_config = RAGPipelineExecutor.parse_filter_config(filter_config_str)
             trial_config.update(parsed_config)
             trial_config.pop('passage_filter_config', None)
         
@@ -273,7 +273,7 @@ class ComponentwiseRAGProcessor:
             prompt_config_str = trial_config['prompt_config']
             if prompt_config_str == 'pass_prompt_maker':
                 is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_prompt_config(prompt_config_str)
+            parsed_config = RAGPipelineExecutor.parse_prompt_config(prompt_config_str)
             trial_config.update(parsed_config)
             trial_config.pop('prompt_config', None)
 
@@ -291,7 +291,7 @@ class ComponentwiseRAGProcessor:
     
     def parse_component_config(self, component: str, config: Dict[str, Any]) -> Dict[str, Any]:
         if component == 'retrieval' and 'retrieval_config' in config:
-            parsed_config = self.pipeline_runner._parse_retrieval_config(config['retrieval_config'])
+            parsed_config = RAGPipelineExecutor.parse_retrieval_config(config['retrieval_config'])
             config.update(parsed_config)
             config.pop('retrieval_config', None)
         return config
@@ -312,7 +312,7 @@ class ComponentwiseRAGProcessor:
             qe_best = best_configs['query_expansion']
             if qe_best.get('query_expansion_method') != 'pass_query_expansion':
                 if 'retrieval_config' in qe_best:
-                    parsed = self.pipeline_runner._parse_retrieval_config(qe_best['retrieval_config'])
+                    parsed = RAGPipelineExecutor.parse_retrieval_config(qe_best['retrieval_config'])
                     fixed_config.update(parsed)
                 if 'retriever_top_k' in qe_best:
                     fixed_config['retriever_top_k'] = qe_best['retriever_top_k']
@@ -489,7 +489,7 @@ class ComponentwiseRAGProcessor:
                 else:
                     if col in results:
                         output_df[col] = results[col]
-                    elif f'{col[:-1]}_list' in results: 
+                    elif f'{col[:-1]}_list' in results:
                         output_df[col] = results[f'{col[:-1]}_list']
 
             if 'queries' in qa_data.columns:
@@ -551,7 +551,6 @@ class ComponentwiseRAGProcessor:
         is_componentwise = any(key.endswith('_config') for key in unified_space.keys())
         
         if is_componentwise and component == 'passage_reranker':
-            # For componentwise, convert reranker_config back to method and models
             if 'reranker_config' in unified_space and 'values' in unified_space['reranker_config']:
                 configs = unified_space['reranker_config']['values']
                 methods = []
@@ -601,7 +600,6 @@ class ComponentwiseRAGProcessor:
                         search_space[param_name] = param_info['values']
                         
         elif is_componentwise and component == 'passage_compressor':
-            # Similar handling for compressor
             if 'passage_compressor_config' in unified_space and 'values' in unified_space['passage_compressor_config']:
                 configs = unified_space['passage_compressor_config']['values']
                 search_space['passage_compressor_config'] = configs

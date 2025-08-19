@@ -6,7 +6,6 @@ import os
 import shutil
 from typing import Dict, Any, Union, Tuple
 import time
-from pipeline_component.retrieval import RetrievalModule
 
 class OptunaObjective:
     def __init__(self, search_space, config_generator, pipeline_runner, 
@@ -943,40 +942,15 @@ class OptunaObjective:
         
         qa_subset_path = os.path.join(trial_dir, "data", "qa.parquet")
         self.qa_df.to_parquet(qa_subset_path, index=False)
-        
-        if self.search_type == 'grid':
-            from optuna_rag.cached_rag_pipeline_runner import CachedRAGPipelineRunner
-            
-            if self.cached_pipeline_runner is None:
-                self.cached_pipeline_runner = CachedRAGPipelineRunner(
-                    config_generator=self.config_generator,
-                    retrieval_metrics=self.pipeline_runner.retrieval_metrics,
-                    filter_metrics=self.pipeline_runner.filter_metrics,
-                    compressor_metrics=self.pipeline_runner.compressor_metrics,
-                    generation_metrics=self.pipeline_runner.generation_metrics,
-                    prompt_maker_metrics=self.pipeline_runner.prompt_maker_metrics,
-                    query_expansion_metrics=self.pipeline_runner.query_expansion_metrics,
-                    reranker_metrics=self.pipeline_runner.reranker_metrics,
-                    retrieval_weight=self.pipeline_runner.retrieval_weight,
-                    generation_weight=self.pipeline_runner.generation_weight,
-                    json_manager=None,
-                    cache_manager=self.component_cache if self.use_cache else None,
-                    use_ragas=self.pipeline_runner.use_ragas,
-                    ragas_config=self.pipeline_runner.ragas_config,
-                    use_llm_evaluator=self.pipeline_runner.use_llm_evaluator,
-                    llm_evaluator_config=self.pipeline_runner.llm_evaluator_config
-                )
-            
-            results = self.cached_pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
-        else:
-            results = self.pipeline_runner.run_pipeline(
-                config=params,
-                trial_dir=trial_dir,
-                qa_subset=self.qa_df,
-                is_local_optimization=False,
-                current_component=None
-            )
-        
+
+        results = self.pipeline_runner.run_pipeline(
+            config=params,
+            trial_dir=trial_dir,
+            qa_subset=self.qa_df,
+            is_local_optimization=False,
+            current_component=None
+        )
+    
         execution_time = time.time() - trial_start_time
         trial.set_user_attr('execution_time', execution_time)
         

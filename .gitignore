@@ -1,0 +1,65 @@
+.env
+data-ingestion-local/
+__pycache__
+boah-env/
+get-pip.py
+results/
+project/
+RayTune/ray_results
+trial/
+RayTune/autorag_project
+RayTune/componentwise/autorag_project
+RayTune/componentwise/ray_results
+bayesian_optimisation.egg-info/
+save/
+dataset/
+RayTune/BO_global_optimization/autorag_project
+RayTune/BO_global_optimization/bohb/wandb
+RayTune/BO_global_optimization/bohb/autorag_project
+optuna_rag/smac3/tpe_optimization_results
+optuna_rag/optuna_grid_search/optuna_grid_search_results
+optuna_rag/optuna_bo/wandb
+optuna_rag/optuna_bo/bo_multifidelity_results
+optuna_rag/optuna_bo/bo_optimization_results
+optuna_rag/optuna_bo/componentwise_optuna_results
+optuna_rag/optuna_grid_search/wandb
+optuna_rag/optuna_bo/optuna_results
+autorag_project/
+smac3/wandb
+smac3/componentwise_optimization_results
+smac3/bohb_optimization_results
+smac3/smac_optimization_results
+hebo/hebo_optimization_results
+hebo/wandb
+
+
+# Conda environment
+.conda/
+env/
+*.conda
+
+# Gradle cache
+.gradle/
+
+# Docker
+.docker/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# VS Code settings
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# macOS or Linux hidden files
+.DS_Store
+*.swp
+*~
+
+# Ignore all hidden files/folders from home
+/home/your_username/.*
+

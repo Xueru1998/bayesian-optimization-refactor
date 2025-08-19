@@ -59,7 +59,7 @@ class EmbeddingManager:
                     print(f"Error: Failed to copy {bm25_file} to trial directory")
                     success = False
             else:
-                print(f"Warning: BM25 file {bm25_file} not found in centralized location at {source_path}")
+                print(f"Warning: BM25 file {bm25_file} not found in at {source_path}")
         
         vectordb_configs = self.get_vectordb_configs(trial_dir)
         for vdb_name, vdb_config in vectordb_configs.items():

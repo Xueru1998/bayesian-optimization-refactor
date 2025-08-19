@@ -3,6 +3,7 @@ import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.pipeline_executor import RAGPipelineExecutor
 from pipeline.config_manager import ConfigGenerator
 from pipeline.search_space_calculator import SearchSpaceCalculator
 
@@ -32,6 +33,7 @@ class ComponentwiseRAGProcessor:
         
         self._setup_metrics()
         self._setup_pipeline_runner()
+        self.executor = RAGPipelineExecutor(config_generator)
     
     def _setup_metrics(self):
         self.retrieval_metrics = self.config_generator.extract_retrieval_metrics_from_config()
@@ -57,6 +59,7 @@ class ComponentwiseRAGProcessor:
             use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
             llm_evaluator_model=self.llm_evaluator_model
         )
+        
     def get_component_order(self) -> List[str]:
         component_order = []
         if 'node_lines' in self.config_template:
@@ -83,83 +86,89 @@ class ComponentwiseRAGProcessor:
     def parse_trial_config(self, component: str, trial_config: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         is_pass_component = False
         
-        if component == 'retrieval' and 'retrieval_config' in trial_config:
-            retrieval_config_str = trial_config['retrieval_config']
-            if retrieval_config_str.startswith('bm25_'):
-                tokenizer = retrieval_config_str.replace('bm25_', '')
-                trial_config['retrieval_method'] = 'bm25'
-                trial_config['bm25_tokenizer'] = tokenizer
-            elif retrieval_config_str.startswith('vectordb_'):
-                vdb_name = retrieval_config_str.replace('vectordb_', '')
-                trial_config['retrieval_method'] = 'vectordb'
-                trial_config['vectordb_name'] = vdb_name
+        config_mapping = {
+            'query_expansion': ('query_expansion_config', self.executor._parse_query_expansion_config),
+            'retrieval': ('retrieval_config', self.executor._parse_retrieval_config),
+            'passage_reranker': ('reranker_config', self.executor._parse_reranker_config),
+            'passage_filter': ('passage_filter_config', self.executor._parse_filter_config),
+            'passage_compressor': ('compressor_config', self.executor._parse_compressor_config),
+            'prompt_maker_generator': ('prompt_config', self.executor._parse_prompt_config)
+        }
+        
+        if component in config_mapping:
+            config_key, parse_func = config_mapping[component]
             
-            trial_config.pop('retrieval_config', None)
-        
-        elif component == 'query_expansion' and 'query_expansion_config' in trial_config:
-            qe_config_str = trial_config['query_expansion_config']
-            if qe_config_str == 'pass_query_expansion':
-                is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_query_expansion_config(qe_config_str)
-            trial_config.update(parsed_config)
-            trial_config.pop('query_expansion_config', None)
-        
-        elif component == 'passage_compressor' and 'passage_compressor_config' in trial_config:
-            comp_config_str = trial_config['passage_compressor_config']
-            if comp_config_str == 'pass_compressor':
-                is_pass_component = True
-                trial_config['passage_compressor_method'] = 'pass_compressor'
-            else:
-                parts = comp_config_str.split('::')
-                if len(parts) >= 2:
-                    method = parts[0]
-                    trial_config['passage_compressor_method'] = method
+            if config_key in trial_config:
+                config_str = trial_config[config_key]
+                
+                if component == 'retrieval' and config_str.startswith('bm25_'):
+                    tokenizer = config_str.replace('bm25_', '')
+                    trial_config['retrieval_method'] = 'bm25'
+                    trial_config['bm25_tokenizer'] = tokenizer
+                elif component == 'retrieval' and config_str.startswith('vectordb_'):
+                    vdb_name = config_str.replace('vectordb_', '')
+                    trial_config['retrieval_method'] = 'vectordb'
+                    trial_config['vectordb_name'] = vdb_name
+                else:
+                    parsed_config = parse_func(config_str)
+                    trial_config.update(parsed_config)
                     
-                    if method in ['tree_summarize', 'refine']:
-                        llm_model = parts[1]
-                        trial_config['compressor_llm_model'] = llm_model
-                        if '_' in llm_model:
-                            llm, model = llm_model.split('_', 1)
-                            trial_config['compressor_llm'] = llm
-                            trial_config['compressor_model'] = model
+                    pass_methods = {
+                        'query_expansion': 'pass_query_expansion',
+                        'passage_reranker': 'pass_reranker',
+                        'passage_filter': 'pass_passage_filter',
+                        'passage_compressor': 'pass_compressor',
+                        'prompt_maker_generator': 'pass_prompt_maker'
+                    }
                     
-                    elif method == 'lexrank':
-                        trial_config['compressor_compression_ratio'] = float(parts[1])
-                        trial_config['compressor_threshold'] = 0.1
-                        trial_config['compressor_damping'] = 0.85
-                        trial_config['compressor_max_iterations'] = 30
-                    
-                    elif method == 'spacy':
-                        trial_config['compressor_compression_ratio'] = float(parts[1])
-                        if len(parts) >= 3:
-                            trial_config['compressor_spacy_model'] = parts[2]
-                        else:
-                            trial_config['compressor_spacy_model'] = 'en_core_web_sm'
-            
-            trial_config.pop('passage_compressor_config', None)
+                    if component in pass_methods and config_str == pass_methods[component]:
+                        is_pass_component = True
+                
+                trial_config.pop(config_key, None)
         
-        elif component == 'passage_compressor':
-            if 'passage_compressor_method' in trial_config:
-                if trial_config['passage_compressor_method'] == 'pass_compressor':
+        if component == 'passage_compressor':
+            if 'passage_compressor_config' in trial_config:
+                comp_config_str = trial_config['passage_compressor_config']
+                if comp_config_str == 'pass_compressor':
                     is_pass_component = True
-                elif 'compressor_llm_model' in trial_config:
-                    llm_model = trial_config.pop('compressor_llm_model', '')
-                    if '_' in llm_model:
-                        llm, model = llm_model.split('_', 1)
-                        trial_config['compressor_llm'] = llm
-                        trial_config['compressor_model'] = model
-        
-        elif component == 'passage_compressor' and 'compressor_config' in trial_config:
-            comp_config_str = trial_config['compressor_config']
-            if comp_config_str == 'pass_compressor':
-                is_pass_component = True
-                trial_config['passage_compressor_method'] = 'pass_compressor'
-            else:
-                parsed_config = self.pipeline_runner._parse_compressor_config(comp_config_str)
-                trial_config.update(parsed_config)
-            trial_config.pop('compressor_config', None)
+                    trial_config['passage_compressor_method'] = 'pass_compressor'
+                else:
+                    parts = comp_config_str.split('::')
+                    if len(parts) >= 2:
+                        method = parts[0]
+                        trial_config['passage_compressor_method'] = method
+                        
+                        if method in ['tree_summarize', 'refine']:
+                            llm_model = parts[1]
+                            trial_config['compressor_llm_model'] = llm_model
+                            if '_' in llm_model:
+                                llm, model = llm_model.split('_', 1)
+                                trial_config['compressor_llm'] = llm
+                                trial_config['compressor_model'] = model
+                        
+                        elif method == 'lexrank':
+                            trial_config['compressor_compression_ratio'] = float(parts[1])
+                            trial_config['compressor_threshold'] = 0.1
+                            trial_config['compressor_damping'] = 0.85
+                            trial_config['compressor_max_iterations'] = 30
+                        
+                        elif method == 'spacy':
+                            trial_config['compressor_compression_ratio'] = float(parts[1])
+                            if len(parts) >= 3:
+                                trial_config['compressor_spacy_model'] = parts[2]
+                            else:
+                                trial_config['compressor_spacy_model'] = 'en_core_web_sm'
+                
+                trial_config.pop('passage_compressor_config', None)
             
-        elif component == 'generator' and 'generator_config' in trial_config:
+            elif 'compressor_llm_model' in trial_config:
+                llm_model = trial_config.pop('compressor_llm_model', '')
+                if '_' in llm_model:
+                    llm, model = llm_model.split('_', 1)
+                    trial_config['compressor_llm'] = llm
+                    trial_config['compressor_model'] = model
+        
+        if component in ['generator', 'prompt_maker_generator'] and 'generator_config' in trial_config:
             gen_config_str = trial_config['generator_config']
             parts = gen_config_str.split('::', 1)
             if len(parts) == 2:
@@ -175,61 +184,24 @@ class ComponentwiseRAGProcessor:
             
             trial_config.pop('generator_config', None)
         
-        elif component == 'prompt_maker_generator' and 'generator_config' in trial_config:
-            gen_config_str = trial_config['generator_config']
-            parts = gen_config_str.split('::', 1)
-            if len(parts) == 2:
-                module_type, model = parts
-                trial_config['generator_module_type'] = module_type
-                trial_config['generator_model'] = model
-                
-                unified_params = self.config_generator.extract_unified_parameters('generator')
-                for module_config in unified_params.get('module_configs', []):
-                    if module_config['module_type'] == module_type and model in module_config['models']:
-                        trial_config['generator_llm'] = module_config.get('llm', 'openai')
-                        break
-            
-            trial_config.pop('generator_config', None)
-        
-        elif component == 'passage_reranker' and 'reranker_config' in trial_config:
-            reranker_config_str = trial_config['reranker_config']
-            if reranker_config_str == 'pass_reranker':
-                is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_reranker_config(reranker_config_str)
-            trial_config.update(parsed_config)
-            trial_config.pop('reranker_config', None)
-        
-        elif component == 'passage_filter' and 'passage_filter_config' in trial_config:
-            filter_config_str = trial_config['passage_filter_config']
-            if filter_config_str == 'pass_passage_filter':
-                is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_filter_config(filter_config_str)
-            trial_config.update(parsed_config)
-            trial_config.pop('passage_filter_config', None)
-        
-        elif component == 'prompt_maker_generator' and 'prompt_config' in trial_config:
-            prompt_config_str = trial_config['prompt_config']
-            if prompt_config_str == 'pass_prompt_maker':
-                is_pass_component = True
-            parsed_config = self.pipeline_runner._parse_prompt_config(prompt_config_str)
-            trial_config.update(parsed_config)
-            trial_config.pop('prompt_config', None)
-
         if not is_pass_component:
-            if component == 'passage_filter' and trial_config.get('passage_filter_method') == 'pass_passage_filter':
-                is_pass_component = True
-            elif component == 'passage_reranker' and trial_config.get('passage_reranker_method') == 'pass_reranker':
-                is_pass_component = True
-            elif component == 'passage_compressor' and trial_config.get('passage_compressor_method') == 'pass_compressor':
-                is_pass_component = True
-            elif component == 'query_expansion' and trial_config.get('query_expansion_method') == 'pass_query_expansion':
-                is_pass_component = True
+            pass_method_keys = {
+                'passage_filter': ('passage_filter_method', 'pass_passage_filter'),
+                'passage_reranker': ('passage_reranker_method', 'pass_reranker'),
+                'passage_compressor': ('passage_compressor_method', 'pass_compressor'),
+                'query_expansion': ('query_expansion_method', 'pass_query_expansion')
+            }
+            
+            if component in pass_method_keys:
+                method_key, pass_value = pass_method_keys[component]
+                if trial_config.get(method_key) == pass_value:
+                    is_pass_component = True
         
         return trial_config, is_pass_component
     
     def parse_component_config(self, component: str, config: Dict[str, Any]) -> Dict[str, Any]:
         if component == 'retrieval' and 'retrieval_config' in config:
-            parsed_config = self.pipeline_runner._parse_retrieval_config(config['retrieval_config'])
+            parsed_config = self.executor._parse_retrieval_config(config['retrieval_config'])
             config.update(parsed_config)
             config.pop('retrieval_config', None)
         return config
@@ -250,7 +222,7 @@ class ComponentwiseRAGProcessor:
             qe_best = best_configs['query_expansion']
             if qe_best.get('query_expansion_method') != 'pass_query_expansion':
                 if 'retrieval_config' in qe_best:
-                    parsed = self.pipeline_runner._parse_retrieval_config(qe_best['retrieval_config'])
+                    parsed = self.executor._parse_retrieval_config(qe_best['retrieval_config'])
                     fixed_config.update(parsed)
                 if 'retriever_top_k' in qe_best:
                     fixed_config['retriever_top_k'] = qe_best['retriever_top_k']
@@ -279,14 +251,12 @@ class ComponentwiseRAGProcessor:
                             for col in best_prev_df.columns:
                                 if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']:
                                     qa_subset[col] = best_prev_df[col]
-                            print(f"[{component}] Merged columns from {prev_comp}: {[col for col in best_prev_df.columns if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']]}")
                             best_output_loaded = True
                         
                         trial_prev_path = os.path.join(trial_dir, f"{prev_comp}_output.parquet")
                         best_prev_df.to_parquet(trial_prev_path)
                         break
-        
-        print(f"[{component}] Final qa_subset columns before pipeline run: {list(qa_subset.columns)}")
+                    
         return qa_subset
     
     def run_pipeline(self, config: Dict[str, Any], trial_dir: str, qa_subset: pd.DataFrame,
@@ -309,7 +279,6 @@ class ComponentwiseRAGProcessor:
 
         full_config.update(config)
 
-        # Call the pipeline runner
         results = self.pipeline_runner.run_pipeline(
             config=full_config, 
             trial_dir=trial_dir, 
@@ -318,12 +287,10 @@ class ComponentwiseRAGProcessor:
             current_component=component
         )
         
-        # Ensure we always return a dictionary
         if results is None:
             print(f"[WARNING] Pipeline returned None for component {component}")
             results = {}
         
-        # Ensure working_df is always present
         if 'working_df' not in results:
             results['working_df'] = qa_subset
         
@@ -332,27 +299,18 @@ class ComponentwiseRAGProcessor:
     def extract_detailed_metrics(self, component: str, results: Dict[str, Any]) -> Dict[str, Any]:
         detailed_metrics = {}
         
-        if component == 'retrieval' or component == 'query_expansion':
-            if 'retrieval_metrics' in results:
-                detailed_metrics.update(results['retrieval_metrics'])
-            if 'query_expansion_metrics' in results:
-                detailed_metrics.update(results['query_expansion_metrics'])
-        elif component == 'passage_reranker':
-            if 'reranker_metrics' in results:
-                detailed_metrics.update(results['reranker_metrics'])
-        elif component == 'passage_filter':
-            if 'filter_metrics' in results:
-                detailed_metrics.update(results['filter_metrics'])
-        elif component == 'passage_compressor':
-            if 'compression_metrics' in results:
-                detailed_metrics.update(results['compression_metrics'])
-            if 'compressor_metrics' in results:
-                detailed_metrics.update(results['compressor_metrics'])
-        elif component == 'prompt_maker_generator':
-            if 'prompt_maker_metrics' in results:
-                detailed_metrics.update(results['prompt_maker_metrics'])
-            if 'generation_metrics' in results:
-                detailed_metrics.update(results['generation_metrics'])
+        metrics_mapping = {
+            'retrieval': ['retrieval_metrics'],
+            'query_expansion': ['retrieval_metrics', 'query_expansion_metrics'],
+            'passage_reranker': ['reranker_metrics'],
+            'passage_filter': ['filter_metrics'],
+            'passage_compressor': ['compression_metrics', 'compressor_metrics'],
+            'prompt_maker_generator': ['prompt_maker_metrics', 'generation_metrics']
+        }
+        
+        for metric_key in metrics_mapping.get(component, []):
+            if metric_key in results:
+                detailed_metrics.update(results[metric_key])
         
         return detailed_metrics
     
@@ -385,30 +343,30 @@ class ComponentwiseRAGProcessor:
                     
                 print(f"[{component}] Pass component final score: {score}")
         else:
-            if component == 'retrieval':
-                score = results.get('last_retrieval_score', 0.0)
-            elif component == 'query_expansion':
-                if results.get('query_expansion_score', 0.0) > 0:
-                    score = results.get('query_expansion_score', 0.0)
-                else:
+            score_mapping = {
+                'retrieval': 'last_retrieval_score',
+                'query_expansion': 'query_expansion_score',
+                'passage_reranker': 'reranker_score',
+                'passage_filter': 'filter_score',
+                'passage_compressor': 'compressor_score',
+                'prompt_maker_generator': 'combined_score'
+            }
+            
+            if component == 'query_expansion':
+                score = results.get('query_expansion_score', 0.0)
+                if score == 0.0:
                     score = results.get('retrieval_score', results.get('last_retrieval_score', 0.0))
-            elif component == 'passage_reranker':
-                score = results.get('reranker_score', results.get('last_retrieval_score', 0.0))
-            elif component == 'passage_filter':
-                score = results.get('filter_score', results.get('last_retrieval_score', 0.0))
             elif component == 'passage_compressor':
                 score = results.get('compressor_score', 0.0) 
                 if score == 0.0:
                     score = results.get('compression_score', 0.0) 
                 if score == 0.0:
-                    score = results.get('compressor_llm_score', 0.0)  
+                    score = results.get('compressor_llm_score', 0.0)
                 if score == 0.0:
-                    score = results.get('last_retrieval_score', 0.0)  
-                
+                    score = results.get('last_retrieval_score', 0.0)
                 print(f"[{component}] Compressor score: {score} (from results: compressor_score={results.get('compressor_score', 'N/A')}, compression_score={results.get('compression_score', 'N/A')}, compressor_llm_score={results.get('compressor_llm_score', 'N/A')})")
             elif component == 'prompt_maker_generator':
                 has_generator = 'generation_score' in results
-                
                 if has_generator:
                     score = results.get('combined_score', 0.0)
                     print(f"[{component}] Generator exists, using combined score: {score:.4f}")
@@ -416,7 +374,8 @@ class ComponentwiseRAGProcessor:
                     score = results.get('last_retrieval_score', 0.0)
                     print(f"[{component}] No generator, using retrieval score: {score:.4f}")
             else:
-                score = results.get('combined_score', 0.0)
+                primary_key = score_mapping.get(component, 'combined_score')
+                score = results.get(primary_key, results.get('last_retrieval_score', 0.0))
         
         return score
     
@@ -424,8 +383,6 @@ class ComponentwiseRAGProcessor:
                             results: Dict[str, Any], qa_data: pd.DataFrame) -> str:
         
         output_df = qa_data.copy()
-        
-        print(f"[{component}] Initial columns in qa_data: {list(qa_data.columns)}")
 
         if component == 'query_expansion':
             if 'retrieval_df' in results:

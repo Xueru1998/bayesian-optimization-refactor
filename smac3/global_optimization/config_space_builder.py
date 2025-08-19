@@ -117,8 +117,7 @@ class SMACConfigSpaceBuilder:
                         ForbiddenEqualsClause(cs['passage_filter_method'], filter_method)
                     )
                 )
-                    
-                print(f"[DEBUG] Added constraint: {reranker_top_k_param}=1 forces passage_filter_method='pass_passage_filter'")
+
         
         return cs
     
@@ -839,7 +838,7 @@ class SMACConfigSpaceBuilder:
                 cleaned.pop('compression_ratio', None)
                 cleaned.pop('compressor_compression_ratio', None)
                 
-                return cleaned
+        return cleaned
     
     def get_search_space_info(self) -> Dict[str, Any]:
         unified_space = self.get_unified_space()

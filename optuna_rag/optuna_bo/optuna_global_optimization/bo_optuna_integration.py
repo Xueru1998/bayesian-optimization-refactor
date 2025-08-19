@@ -19,7 +19,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from optuna_rag.optuna_bo.optuna_global_optimization.objective import OptunaObjective
@@ -58,7 +58,9 @@ class BOPipelineOptimizer:
         ragas_embedding_model: str = "text-embedding-ada-002",
         ragas_metrics: Optional[Dict[str, List[str]]] = None,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o"
+        llm_evaluator_model: str = "gpt-4o",
+        component_early_stopping_enabled: bool = True,
+        component_early_stopping_thresholds: Optional[Dict[str, float]] = None
     ):
         self.start_time = time.time()
         
@@ -68,13 +70,13 @@ class BOPipelineOptimizer:
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
             
-        print(f"BO using centralized config file: {self.config_path}")
+        print(f"BO using config file: {self.config_path}")
         
         self.qa_df = qa_df
         self.corpus_df = corpus_df
         
         self.project_dir = Utils.get_centralized_project_dir(project_dir)
-        print(f"BO using centralized project directory: {self.project_dir}")
+        print(f"BO using project directory: {self.project_dir}")
         
         with open(self.config_path, 'r') as f:
             self.config_template = yaml.safe_load(f)
@@ -108,6 +110,18 @@ class BOPipelineOptimizer:
         self.wandb_run_name = wandb_run_name or self.study_name
         self.optimizer = optimizer
         self.early_stopping_threshold = early_stopping_threshold
+
+        self.component_early_stopping_enabled = component_early_stopping_enabled
+        if component_early_stopping_thresholds is None:
+            self.component_early_stopping_thresholds = {
+                'retrieval': 0.1,
+                'query_expansion': 0.1,
+                'reranker': 0.2,
+                'filter': 0.25,
+                'compressor': 0.3
+            }
+        else:
+            self.component_early_stopping_thresholds = component_early_stopping_thresholds
         
         self.use_ragas = use_ragas
         self.ragas_llm_model = ragas_llm_model
@@ -174,6 +188,8 @@ class BOPipelineOptimizer:
             self.prompt_maker_metrics = self.config_generator.extract_generation_metrics_from_config(node_type='prompt_maker')
 
     def _initialize_pipeline_runner(self):
+        early_stopping_thresholds = self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None
+        
         if self.use_ragas:
             ragas_config = {
                 'llm_model': self.ragas_llm_model,
@@ -196,7 +212,8 @@ class BOPipelineOptimizer:
                 use_ragas=True,
                 ragas_config=ragas_config,
                 use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-                llm_evaluator_model=self.llm_evaluator_model
+                llm_evaluator_model=self.llm_evaluator_model,
+                early_stopping_thresholds=early_stopping_thresholds  
             )
         else:
             self.pipeline_runner = RAGPipelineRunner(
@@ -211,7 +228,8 @@ class BOPipelineOptimizer:
                 retrieval_weight=self.retrieval_weight,
                 generation_weight=self.generation_weight,
                 use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-                llm_evaluator_model=self.llm_evaluator_model
+                llm_evaluator_model=self.llm_evaluator_model,
+                early_stopping_thresholds=early_stopping_thresholds 
             )
 
     def _print_initialization_summary(self):
@@ -230,6 +248,15 @@ class BOPipelineOptimizer:
         
         print("\n===== RAG Pipeline Optimizer Initialized =====")
         print(f"Using {self.n_trials} trials with {self.optimizer.upper()} sampler")
+
+        if self.component_early_stopping_enabled:
+            print(f"\nComponent-level early stopping ENABLED with thresholds:")
+            for component, threshold in self.component_early_stopping_thresholds.items():
+                print(f"  {component}: {threshold}")
+        else:
+            print(f"\nComponent-level early stopping DISABLED")
+        
+        print(f"\nHigh-score early stopping threshold: {self.early_stopping_threshold}")
         
         if self.use_ragas:
             print(f"\nEvaluation Method: RAGAS")
@@ -270,17 +297,34 @@ class BOPipelineOptimizer:
         start_time = time.time()
         
         try:
-            objective_instance = OptunaObjective(
-                search_space=self.search_space,
-                config_generator=self.config_generator,
-                pipeline_runner=self.pipeline_runner,
-                component_cache=None,
-                corpus_df=self.corpus_df,
-                qa_df=self.qa_df,
-                use_cache=False,
-            )
+            early_stopped = False
+            early_stopped_component = None
+            early_stopped_score = None
+            
+            try:
+                objective_instance = OptunaObjective(
+                    search_space=self.search_space,
+                    config_generator=self.config_generator,
+                    pipeline_runner=self.pipeline_runner,
+                    component_cache=None,
+                    corpus_df=self.corpus_df,
+                    qa_df=self.qa_df,
+                    use_cache=False,
+                )
 
-            score = objective_instance(trial)
+                score = objective_instance(trial)
+                
+            except EarlyStoppingException as e:
+                early_stopped = True
+                early_stopped_component = e.component
+                early_stopped_score = e.score
+                score = e.score 
+                
+                print(f"\n[Trial {trial.number}] Early stopped at {e.component} with score {e.score:.4f}")
+
+                trial.set_user_attr('early_stopped', True)
+                trial.set_user_attr('early_stopped_component', e.component)
+                trial.set_user_attr('early_stopped_score', e.score)
             
             if score is None or score < 0:
                 score = 0.0
@@ -312,6 +356,11 @@ class BOPipelineOptimizer:
                 trial.number, display_config, score, latency, trial.user_attrs
             )
 
+            if early_stopped:
+                trial_result['early_stopped'] = True
+                trial_result['early_stopped_component'] = early_stopped_component
+                trial_result['early_stopped_score'] = early_stopped_score
+
             if self.use_wandb:
                 WandBLogger.log_trial_metrics(trial, score, results=trial_result)
                 
@@ -323,8 +372,12 @@ class BOPipelineOptimizer:
                     "trial": trial.number, 
                     "score": score,
                     "execution_time_s": round(execution_time, 2),
-                    "status": "COMPLETE" 
+                    "status": "EARLY_STOPPED" if early_stopped else "COMPLETE"
                 }
+                
+                if early_stopped:
+                    row_data["early_stopped_component"] = early_stopped_component
+                    row_data["early_stopped_score"] = early_stopped_score
                 
                 for param_name, param_value in trial.params.items():
                     row_data[param_name] = param_value
@@ -349,7 +402,8 @@ class BOPipelineOptimizer:
 
                 wandb.log({
                     "multi_objective/score": score,
-                    "multi_objective/latency": latency
+                    "multi_objective/latency": latency,
+                    "early_stopped": early_stopped
                 }, step=trial.number)
 
             self._update_best_results(score, latency, display_config)
@@ -358,6 +412,9 @@ class BOPipelineOptimizer:
             Utils.save_optimization_results(self.result_dir, self.all_trials, self.best_score, self.best_latency)
 
             print(f"\nTrial {trial.number} completed:")
+            if early_stopped:
+                print(f"  Status: EARLY STOPPED at {early_stopped_component}")
+                print(f"  Component score: {early_stopped_score:.4f} < threshold {self.component_early_stopping_thresholds.get(early_stopped_component, 'N/A')}")
             print(f"  Score: {score:.4f}" + (" (RAGAS)" if self.use_ragas else ""))
             print(f"  Latency: {latency:.2f}s")
             
@@ -420,6 +477,11 @@ class BOPipelineOptimizer:
             "timestamp": time.time(),
             **all_component_metrics
         }
+
+        if user_attrs.get("early_stopped", False):
+            trial_result["early_stopped"] = True
+            trial_result["early_stopped_component"] = user_attrs.get("early_stopped_component")
+            trial_result["early_stopped_score"] = user_attrs.get("early_stopped_score")
         
         if self.use_ragas:
             trial_result["ragas_mean_score"] = user_attrs.get("ragas_mean_score", 0.0)
@@ -456,6 +518,7 @@ class BOPipelineOptimizer:
         Utils.save_results_to_csv(self.result_dir, "optuna_trials.csv", df)
         
         all_metrics = []
+        early_stopped_count = 0
         for trial in study.trials:
             if trial.state == optuna.trial.TrialState.COMPLETE:
                 gen_score = trial.user_attrs.get('generator_score', trial.user_attrs.get('generation_score', 0.0))
@@ -470,9 +533,17 @@ class BOPipelineOptimizer:
 
                 metrics['generator_score'] = gen_score
                 
+                if trial.user_attrs.get('early_stopped', False):
+                    early_stopped_count += 1
+                    metrics['early_stopped'] = True
+                    metrics['early_stopped_component'] = trial.user_attrs.get('early_stopped_component')
+                    metrics['early_stopped_score'] = trial.user_attrs.get('early_stopped_score')
+                
                 all_metrics.append(metrics)
         
         Utils.save_results_to_csv(self.result_dir, "all_metrics.csv", all_metrics)
+        
+        print(f"\nTotal early stopped trials: {early_stopped_count} out of {len(study.trials)}")
         
         best_trials = study.best_trials
         if best_trials:
@@ -507,9 +578,11 @@ class BOPipelineOptimizer:
                     print(f"Generator Score: {gen_score:.4f}")
     
     def _find_best_config(self, study: optuna.Study) -> Optional[Dict[str, Any]]:
+        # Filter out early stopped trials when finding best config
+        valid_trials = [t for t in self.all_trials if not t.get('early_stopped', False)]
+        
         high_score_trials = []
-
-        for trial in self.all_trials:
+        for trial in valid_trials:
             if trial['score'] > 0.9:
                 high_score_trials.append(trial)
         
@@ -517,9 +590,8 @@ class BOPipelineOptimizer:
             best_trial = min(high_score_trials, key=lambda x: x['latency'])
             return best_trial
 
-        pareto_front = Utils.find_pareto_front(self.all_trials)
+        pareto_front = Utils.find_pareto_front(valid_trials)
         if pareto_front:
-
             for trial in sorted(pareto_front, key=lambda x: -x['score']):
                 if trial['score'] > 0.8:
                     return trial
@@ -553,7 +625,9 @@ class BOPipelineOptimizer:
                 "ragas_enabled": self.use_ragas,
                 "ragas_llm_model": self.ragas_llm_model if self.use_ragas else None,
                 "ragas_embedding_model": self.ragas_embedding_model if self.use_ragas else None,
-                "ragas_metrics": self.ragas_metrics if self.use_ragas else None
+                "ragas_metrics": self.ragas_metrics if self.use_ragas else None,
+                "component_early_stopping_enabled": self.component_early_stopping_enabled,
+                "component_early_stopping_thresholds": self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None
             }
             
             wandb.init(
@@ -661,9 +735,14 @@ class BOPipelineOptimizer:
             
             best_config = self._find_best_config(study)
             
+            # Count early stopped trials
+            early_stopped_count = sum(1 for t in self.all_trials if t.get('early_stopped', False))
+            
             print("\n===== Optimization Results =====")
             print(f"Total optimization time: {time_str}")
             print(f"Total trials: {len(self.all_trials)}")
+            print(f"Early stopped trials: {early_stopped_count}")
+            print(f"Completed trials: {len(self.all_trials) - early_stopped_count}")
             print(f"Sampler used: {self.optimizer.upper()}")
             
             if best_config:
@@ -683,7 +762,9 @@ class BOPipelineOptimizer:
             print(f"  Latency: {self.best_latency['value']:.2f}s")
             print(f"  Config: {self.best_latency['config']}")
             
-            pareto_front = Utils.find_pareto_front(self.all_trials)
+            # Only consider non-early-stopped trials for Pareto front
+            valid_trials = [t for t in self.all_trials if not t.get('early_stopped', False)]
+            pareto_front = Utils.find_pareto_front(valid_trials)
             
             print(f"\nPareto optimal solutions: {len(pareto_front)}")
             for i, trial in enumerate(pareto_front[:5]):
@@ -701,10 +782,14 @@ class BOPipelineOptimizer:
                 "pareto_front": pareto_front,
                 "optimization_time": total_time,
                 "n_trials": len(self.all_trials),
+                "early_stopped_trials": early_stopped_count,
+                "completed_trials": len(self.all_trials) - early_stopped_count,
                 "early_stopped": early_stopping.should_stop,
                 "optimizer": self.optimizer,
                 "total_trials": len(self.all_trials),
-                "all_trials": self.all_trials
+                "all_trials": self.all_trials,
+                "component_early_stopping_enabled": self.component_early_stopping_enabled,
+                "component_early_stopping_thresholds": self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None
             }
 
             if best_config:
@@ -721,6 +806,8 @@ class BOPipelineOptimizer:
                 wandb.summary["best_score"] = self.best_score["value"]
                 wandb.summary["best_latency"] = self.best_latency["value"]
                 wandb.summary["total_trials"] = len(self.all_trials)
+                wandb.summary["early_stopped_trials"] = early_stopped_count
+                wandb.summary["completed_trials"] = len(self.all_trials) - early_stopped_count
                 wandb.summary["optimization_time"] = total_time
                 wandb.summary["early_stopped"] = early_stopping.should_stop
                 wandb.summary["optimizer"] = self.optimizer

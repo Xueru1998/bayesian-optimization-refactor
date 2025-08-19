@@ -1001,7 +1001,6 @@ class ComponentwiseSMACConfigSpaceBuilder:
                                                 items=reranker_configs,
                                                 default=reranker_configs[0])
                 cs.add(reranker_config_param)
-                print(f"[DEBUG] Added reranker_config with choices: {reranker_configs}")
             
             return cs
         

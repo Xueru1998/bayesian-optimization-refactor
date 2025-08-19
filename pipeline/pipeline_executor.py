@@ -20,6 +20,177 @@ from pipeline.utils import Utils
 class RAGPipelineExecutor:
     def __init__(self, config_generator: ConfigGenerator):
         self.config_generator = config_generator
+    
+    def _parse_query_expansion_config(self, qe_config_str: str) -> Dict[str, Any]:
+        if not qe_config_str:
+            return {}
+        
+        if qe_config_str == 'pass_query_expansion':
+            return {'query_expansion_method': 'pass_query_expansion'}
+
+        if qe_config_str.startswith('query_decompose_'):
+            model = qe_config_str.replace('query_decompose_', '')
+            return {
+                'query_expansion_method': 'query_decompose',
+                'query_expansion_model': model
+            }
+
+        if qe_config_str.startswith('hyde_'):
+            parts = qe_config_str.replace('hyde_', '').rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                model = parts[0]
+                max_token = int(parts[1])
+                return {
+                    'query_expansion_method': 'hyde',
+                    'query_expansion_model': model,
+                    'query_expansion_max_token': max_token
+                }
+            else:
+                return {
+                    'query_expansion_method': 'hyde',
+                    'query_expansion_max_token': int(qe_config_str.split('_')[-1])
+                }
+
+        if qe_config_str.startswith('multi_query_expansion_'):
+            temp = float(qe_config_str.split('_')[-1])
+            return {
+                'query_expansion_method': 'multi_query_expansion',
+                'query_expansion_temperature': temp
+            }
+
+        if qe_config_str == 'query_decompose':
+            return {'query_expansion_method': 'query_decompose'}
+        
+        return {}
+    
+    def _parse_retrieval_config(self, retrieval_config_str: str) -> Dict[str, Any]:
+        if not retrieval_config_str:
+            return {}
+        
+        if retrieval_config_str.startswith('bm25_'):
+            tokenizer = retrieval_config_str.replace('bm25_', '')
+            return {
+                'retrieval_method': 'bm25',
+                'bm25_tokenizer': tokenizer
+            }
+        elif retrieval_config_str.startswith('vectordb_'):
+            vdb_name = retrieval_config_str.replace('vectordb_', '')
+            return {
+                'retrieval_method': 'vectordb',
+                'vectordb_name': vdb_name
+            }
+        
+        return {}
+    
+    def _parse_reranker_config(self, reranker_config_str: str) -> Dict[str, Any]:
+        if not reranker_config_str:
+            return {}
+        
+        if reranker_config_str == 'pass_reranker':
+            return {'passage_reranker_method': 'pass_reranker'}
+        
+        simple_methods = ['upr']
+        if reranker_config_str in simple_methods:
+            return {'passage_reranker_method': reranker_config_str}
+        
+        model_based_methods = [
+            'colbert_reranker',
+            'sentence_transformer_reranker',
+            'flag_embedding_reranker',
+            'flag_embedding_llm_reranker',
+            'openvino_reranker',
+            'flashrank_reranker',
+            'monot5'
+        ]
+        
+        for method in model_based_methods:
+            if reranker_config_str.startswith(method + '_'):
+                model_name = reranker_config_str[len(method) + 1:]
+                return {
+                    'passage_reranker_method': method,
+                    'reranker_model_name': model_name
+                }
+        
+        return {'passage_reranker_method': reranker_config_str}
+    
+    def _parse_filter_config(self, filter_config_str: str) -> Dict[str, Any]:
+        if not filter_config_str:
+            return {}
+        
+        parts = filter_config_str.split('_')
+        
+        if filter_config_str.startswith('threshold_cutoff_'):
+            return {
+                'passage_filter_method': 'threshold_cutoff',
+                'threshold': float(parts[-1])
+            }
+        elif filter_config_str.startswith('percentile_cutoff_'):
+            return {
+                'passage_filter_method': 'percentile_cutoff',
+                'percentile': float(parts[-1])
+            }
+        elif filter_config_str.startswith('similarity_threshold_cutoff_'):
+            return {
+                'passage_filter_method': 'similarity_threshold_cutoff',
+                'threshold': float(parts[-1])
+            }
+        elif filter_config_str.startswith('similarity_percentile_cutoff_'):
+            return {
+                'passage_filter_method': 'similarity_percentile_cutoff',
+                'percentile': float(parts[-1])
+            }
+        
+        return {}
+    
+    def _parse_compressor_config(self, compressor_config_str: str) -> Dict[str, Any]:
+        if not compressor_config_str:
+            return {}
+        
+        if compressor_config_str == 'pass_compressor':
+            return {'passage_compressor_method': 'pass_compressor'}
+        
+        if compressor_config_str.startswith('tree_summarize_') or compressor_config_str.startswith('refine_'):
+            parts = compressor_config_str.split('_', 2)
+            if len(parts) >= 3:
+                method = parts[0] + '_' + parts[1] 
+                llm_and_model = parts[2]
+                
+                llm_parts = llm_and_model.split('_', 1)
+                if len(llm_parts) == 2:
+                    return {
+                        'passage_compressor_method': method,
+                        'compressor_llm': llm_parts[0],
+                        'compressor_model': llm_parts[1]
+                    }
+        
+        return {'passage_compressor_method': compressor_config_str}
+    
+    def _parse_prompt_config(self, prompt_config_str: str) -> Dict[str, Any]:
+        if not prompt_config_str:
+            return {}
+        
+        if prompt_config_str == 'pass_prompt_maker':
+            return {'prompt_maker_method': 'pass_prompt_maker'}
+        
+        known_prompt_methods = ['fstring', 'long_context_reorder', 'window_replacement']
+        
+        parts = prompt_config_str.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            method = parts[0]
+            if method in known_prompt_methods:
+                return {
+                    'prompt_maker_method': method,
+                    'prompt_template_idx': int(parts[1])
+                }
+
+        if prompt_config_str in known_prompt_methods:
+            return {'prompt_maker_method': prompt_config_str}
+        
+        print(f"Warning: Unknown prompt config '{prompt_config_str}'. Using default 'fstring_0'.")
+        return {
+            'prompt_maker_method': 'fstring',
+            'prompt_template_idx': 0
+        }
         
     def _prepare_bm25_index(self, config: Dict[str, Any], trial_dir: str):        
         bm25_tokenizer = config['bm25_tokenizer']
@@ -30,7 +201,7 @@ class RAGPipelineExecutor:
         )
         
         if not os.path.exists(centralized_bm25_file):
-            print(f"Generating BM25 index directly to centralized location for {bm25_tokenizer}")
+            print(f"Generating BM25 index directly to {bm25_tokenizer}")
             corpus_path = os.path.join(Utils.get_centralized_project_dir(), "data", "corpus.parquet")
             if not os.path.exists(corpus_path):
                 corpus_path = os.path.join(trial_dir, "data", "corpus.parquet")
@@ -38,7 +209,7 @@ class RAGPipelineExecutor:
             if os.path.exists(corpus_path):
                 corpus_df = pd.read_parquet(corpus_path, engine="pyarrow")
                 bm25_ingest(centralized_bm25_file, corpus_df, bm25_tokenizer=bm25_tokenizer)
-                print(f"BM25 index saved to centralized location: {centralized_bm25_file}")
+                print(f"BM25 index saved to: {centralized_bm25_file}")
     
     def execute_query_expansion(self, config: Dict[str, Any], trial_dir: str, 
                               working_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[List[str]]]:

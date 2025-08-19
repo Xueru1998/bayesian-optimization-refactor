@@ -17,7 +17,7 @@ from smac.facade import AbstractFacade
 from smac.callback import Callback
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
 from smac3.global_optimization.config_space_builder import SMACConfigSpaceBuilder
@@ -56,7 +56,9 @@ class SMACRAGOptimizer:
         use_ragas: bool = False,  
         ragas_config: Optional[Dict[str, Any]] = None,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o" 
+        llm_evaluator_model: str = "gpt-4o",
+        component_early_stopping_enabled: bool = True,
+        component_early_stopping_thresholds: Optional[Dict[str, float]] = None
     ):
         self.start_time = time.time()
         
@@ -72,6 +74,18 @@ class SMACRAGOptimizer:
         self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
         self.llm_evaluator_model = llm_evaluator_model
         
+        self.component_early_stopping_enabled = component_early_stopping_enabled
+        if component_early_stopping_thresholds is None:
+            self.component_early_stopping_thresholds = {
+                'retrieval': 0.1,
+                'query_expansion': 0.1,
+                'reranker': 0.2,
+                'filter': 0.25,
+                'compressor': 0.3
+            }
+        else:
+            self.component_early_stopping_thresholds = component_early_stopping_thresholds
+        
         self.study_name = study_name if study_name else f"{optimizer}_opt_{int(time.time())}"
         
         self._setup_components()
@@ -81,6 +95,7 @@ class SMACRAGOptimizer:
         
         self.trial_counter = 0
         self.all_trials = []
+        self.early_stopped_trials_count = 0
         
         self._print_initialization_summary()
     
@@ -164,6 +179,8 @@ class SMACRAGOptimizer:
             'embedding_model': "text-embedding-ada-002" 
         }
         
+        early_stopping_thresholds = self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None
+        
         self.runner = RAGPipelineRunner(
             config_generator=self.config_generator,
             retrieval_metrics=self.retrieval_metrics,
@@ -178,8 +195,10 @@ class SMACRAGOptimizer:
             use_ragas=use_ragas, 
             ragas_config=ragas_config,
             use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-            llm_evaluator_model=self.llm_evaluator_model  
+            llm_evaluator_model=self.llm_evaluator_model,
+            early_stopping_thresholds=early_stopping_thresholds
         )
+
     
     def _calculate_trials_if_needed(self):
         if self.n_trials is None:
@@ -325,6 +344,7 @@ class SMACRAGOptimizer:
             return rng.uniform(0.65, 0.85)
     
     def _run_trial(self, config: Dict[str, Any], budget: int, seed: int = 0) -> Dict[str, Any]:
+        
         self.trial_counter += 1
         
         budget_percentage = budget / self.total_samples
@@ -339,22 +359,50 @@ class SMACRAGOptimizer:
         print(f"Trial {self.trial_counter}/{self.n_trials} | Budget: {budget} samples ({budget_percentage:.1%})")
         print(f"{'='*60}")
         
+        early_stopped = False
+        early_stopped_component = None
+        early_stopped_score = None
+        
         try:
             config_dict = self._prepare_config(config)
             trial_config = self.config_generator.generate_trial_config(config_dict)
             self._save_trial_config(trial_dir, trial_config)
             
-            results = self.runner.run_pipeline(config_dict, trial_dir, sampled_qa_data)
-            score = results.get('combined_score', 0.0)
+            try:
+                results = self.runner.run_pipeline(config_dict, trial_dir, sampled_qa_data)
+                score = results.get('combined_score', 0.0)
+                
+            except EarlyStoppingException as e:
+                early_stopped = True
+                early_stopped_component = e.component
+                early_stopped_score = e.score
+                score = e.score
+                self.early_stopped_trials_count += 1
+                
+                print(f"\n[Trial {self.trial_counter}] Early stopped at {e.component} with score {e.score:.4f}")
+                
+                results = {
+                    'combined_score': score,
+                    'early_stopped_at': e.component,
+                    'early_stopped_score': e.score,
+                    'error': e.message
+                }
+            
             latency = time.time() - trial_start_time
             
             trial_result = self._create_trial_result(
                 config_dict, score, latency, budget, budget_percentage, results
             )
+            
+            if early_stopped:
+                trial_result['early_stopped'] = True
+                trial_result['early_stopped_component'] = early_stopped_component
+                trial_result['early_stopped_score'] = early_stopped_score
+            
             self.all_trials.append(trial_result)
             
             self._save_trial_results(trial_dir, trial_result)
-            self._print_trial_summary(score, latency, budget, budget_percentage)
+            self._print_trial_summary(score, latency, budget, budget_percentage, early_stopped, early_stopped_component)
             
             if self.use_wandb:
                 self._log_trial_to_wandb(config_dict, trial_result)
@@ -509,18 +557,32 @@ class SMACRAGOptimizer:
         with open(results_file, 'w') as f:
             json.dump(trial_result, f, indent=2)
     
-    def _print_trial_summary(self, score, latency, budget, budget_percentage):
+    def _print_trial_summary(self, score, latency, budget, budget_percentage, early_stopped=False, early_stopped_component=None):
         print(f"Trial {self.trial_counter} completed:")
+        if early_stopped:
+            print(f"  Status: EARLY STOPPED at {early_stopped_component}")
         print(f"  Score: {score:.4f}")
         print(f"  Latency: {latency:.2f}s")
         print(f"  Budget: {budget} samples ({budget_percentage:.1%})")
+
     
     def _log_trial_to_wandb(self, config_dict, trial_result):
+        log_data = {
+            'trial': trial_result['trial_number'],
+            'score': trial_result['score'],
+            'latency': trial_result['latency'],
+            'early_stopped': trial_result.get('early_stopped', False)
+        }
+        
+        if trial_result.get('early_stopped', False):
+            log_data['early_stopped_component'] = trial_result.get('early_stopped_component', 'unknown')
+            log_data['early_stopped_score'] = trial_result.get('early_stopped_score', 0.0)
+        
         WandBLogger.log_trial_metrics(
             self.trial_counter, 
             trial_result['score'],
             config=config_dict,
-            results=trial_result
+            results={**trial_result, **log_data}
         )
     
     def target_function_standard(self, config: Dict[str, Any], seed: int = 0) -> Dict[str, float]:
@@ -581,6 +643,8 @@ class SMACRAGOptimizer:
             "search_space_size": search_space_info['n_hyperparameters'],
             "study_name": self.study_name,
             "early_stopping_threshold": self.early_stopping_threshold,
+            "component_early_stopping_enabled": self.component_early_stopping_enabled,
+            "component_early_stopping_thresholds": self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None,
             "n_workers": self.n_workers,
             "walltime_limit": self.walltime_limit if self.walltime_limit is not None else "No limit",
             "use_multi_fidelity": self.use_multi_fidelity,
@@ -833,9 +897,11 @@ class SMACRAGOptimizer:
     def _create_optimization_results(self, pareto_front, early_stopped, incumbents, total_time):
         best_configs = self._find_best_configurations(pareto_front)
         
+        valid_trials = [t for t in self.all_trials if not t.get('early_stopped', False)]
+        
         results = {
             'optimizer': self.optimizer,
-            'use_multi_fidelity': bool(self.use_multi_fidelity),  # Ensure bool
+            'use_multi_fidelity': bool(self.use_multi_fidelity),
             'min_budget': int(self.min_budget),
             'max_budget': int(self.max_budget),
             'best_config': self._convert_numpy_types(best_configs['best_balanced']),
@@ -849,15 +915,21 @@ class SMACRAGOptimizer:
             'optimization_time': float(total_time),
             'n_trials': int(self.trial_counter),
             'total_trials': int(self.trial_counter),
+            'early_stopped_trials': int(self.early_stopped_trials_count),
+            'completed_trials': int(self.trial_counter - self.early_stopped_trials_count),
             'early_stopped': bool(early_stopped),
             'incumbents': [self._convert_numpy_types(dict(inc)) for inc in incumbents],
-            'all_trials': [self._convert_numpy_types(trial) for trial in self.all_trials]
+            'all_trials': [self._convert_numpy_types(trial) for trial in self.all_trials],
+            'component_early_stopping_enabled': self.component_early_stopping_enabled,
+            'component_early_stopping_thresholds': self.component_early_stopping_thresholds if self.component_early_stopping_enabled else None
         }
         
         return results
     
     def _find_best_configurations(self, pareto_front):
-        if not self.all_trials:
+        valid_trials = [t for t in self.all_trials if not t.get('early_stopped', False)]
+        
+        if not valid_trials:
             default_trial = {'config': {}, 'score': 0.0, 'latency': float('inf')}
             return {
                 'best_score': default_trial,
@@ -866,13 +938,13 @@ class SMACRAGOptimizer:
             }
         
         if self.use_multi_fidelity:
-            return self._find_best_multifidelity_configs(pareto_front)
+            return self._find_best_multifidelity_configs_with_early_stopping(pareto_front, valid_trials)
         else:
-            return self._find_best_standard_configs(pareto_front)
+            return self._find_best_standard_configs_with_early_stopping(pareto_front, valid_trials)
     
-    def _find_best_multifidelity_configs(self, pareto_front):
+    def _find_best_multifidelity_configs_with_early_stopping(self, pareto_front, valid_trials):
         full_budget_trials = [
-            t for t in self.all_trials 
+            t for t in valid_trials 
             if t.get('budget_percentage', 1.0) >= 0.99
         ]
         
@@ -886,8 +958,8 @@ class SMACRAGOptimizer:
             else:
                 best_balanced = max(full_budget_trials, key=lambda x: x['score'])
         else:
-            best_score_trial = max(self.all_trials, key=lambda x: x['score'])
-            best_latency_trial = min(self.all_trials, key=lambda x: x['latency'])
+            best_score_trial = max(valid_trials, key=lambda x: x['score'])
+            best_latency_trial = min(valid_trials, key=lambda x: x['latency'])
             best_balanced = best_score_trial
         
         return {
@@ -895,16 +967,17 @@ class SMACRAGOptimizer:
             'best_latency': best_latency_trial,
             'best_balanced': best_balanced
         }
-    
-    def _find_best_standard_configs(self, pareto_front):
-        best_score_trial = max(self.all_trials, key=lambda x: x['score'])
-        best_latency_trial = min(self.all_trials, key=lambda x: x['latency'])
+
+    def _find_best_standard_configs_with_early_stopping(self, pareto_front, valid_trials):
+        best_score_trial = max(valid_trials, key=lambda x: x['score'])
+        best_latency_trial = min(valid_trials, key=lambda x: x['latency'])
         
-        high_score_trials = [t for t in self.all_trials if t['score'] > 0.9]
+        high_score_trials = [t for t in valid_trials if t['score'] > 0.9]
         if high_score_trials:
             best_balanced = min(high_score_trials, key=lambda x: x['latency'])
         else:
-            best_balanced = max(pareto_front, key=lambda x: x['score']) if pareto_front else best_score_trial
+            valid_pareto = [p for p in pareto_front if not any(t.get('early_stopped', False) for t in self.all_trials if t['config'] == p['config'])]
+            best_balanced = max(valid_pareto, key=lambda x: x['score']) if valid_pareto else best_score_trial
         
         return {
             'best_score': best_score_trial,
@@ -954,6 +1027,8 @@ class SMACRAGOptimizer:
         print(f"{'='*60}")
         print(f"Total optimization time: {time_str}")
         print(f"Total trials: {self.trial_counter}")
+        print(f"Early stopped trials: {self.early_stopped_trials_count}")
+        print(f"Completed trials: {self.trial_counter - self.early_stopped_trials_count}")
         
         if self.use_multi_fidelity and self.all_trials:
             self._print_multifidelity_summary()
@@ -965,6 +1040,7 @@ class SMACRAGOptimizer:
         self._print_pareto_front_summary(pareto_front)
         
         print(f"\nResults saved to: {self.result_dir}")
+
     
     def _print_multifidelity_summary(self):
         full_budget_count = len([
@@ -1004,6 +1080,15 @@ class SMACRAGOptimizer:
         print(f"\n===== {self.optimizer.upper()} {'Multi-Fidelity ' if self.use_multi_fidelity else ''}RAG Pipeline Optimizer =====")
         print(f"Using {self.n_trials} trials")
         print(f"Objectives: maximize score (weight={self.generation_weight}), minimize latency (weight={self.retrieval_weight})")
+        
+        if self.component_early_stopping_enabled:
+            print(f"\nComponent-level early stopping ENABLED with thresholds:")
+            for component, threshold in self.component_early_stopping_thresholds.items():
+                print(f"  {component}: {threshold}")
+        else:
+            print(f"\nComponent-level early stopping DISABLED")
+        
+        print(f"\nHigh-score early stopping threshold: {self.early_stopping_threshold}")
         
         if self.use_multi_fidelity:
             print(f"\nMulti-fidelity settings:")

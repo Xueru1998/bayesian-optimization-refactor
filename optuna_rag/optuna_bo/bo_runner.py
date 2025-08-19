@@ -365,7 +365,6 @@ class UnifiedOptunaRunner:
         self._resolve_paths(args)
         
         print(f"Using optimization mode: {args.mode.upper()}")
-        print(f"Using project root: {self.project_root}")
         print(f"Using config file: {args.config_path}")
         print(f"Using project directory: {args.project_dir}")
         

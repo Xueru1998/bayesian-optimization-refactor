@@ -311,7 +311,6 @@ class ComponentwiseSMACOptimizer:
         
         full_config = {**fixed_components, **trial_config}
 
-        print(f"[DEBUG] Full config being sent to pipeline: {full_config}")
         print(f"[DEBUG] Is pass component: {is_pass_component}")
         
         cleaned_config = self.config_space_builder.clean_trial_config(full_config)
@@ -657,7 +656,7 @@ class ComponentwiseSMACOptimizer:
 
         print(f"[{component}] Total combinations: {total_combinations}")
         
-        return min(20, total_combinations)
+        return min(5, total_combinations)
 
     def _run_grid_search(self, component: str, cs: ConfigurationSpace, 
                         fixed_config: Dict[str, Any]) -> Configuration:

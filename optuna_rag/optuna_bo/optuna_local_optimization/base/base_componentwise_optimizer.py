@@ -287,6 +287,9 @@ class BaseComponentwiseOptimizer:
                     elif component == 'passage_filter':
                         print(f"    ℹ️  INFO: For filters, the actual search space is continuous")
                         print(f"       between threshold/percentile boundaries")
+                    elif component == 'prompt_maker_generator':
+                        print(f"    ℹ️  INFO: For generator, the actual search space is continuous")
+                        print(f"       selecting from temperature and max token ranges")
                     else:
                         print(f"    ℹ️  INFO: Search space ({combos}) < n_trials ({n_trials})")
                         print(f"       Consider adding more parameter values or reducing n_trials")

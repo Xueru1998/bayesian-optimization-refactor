@@ -234,7 +234,6 @@ class OptunaObjective:
                 debug_dir = os.path.join(trial_dir, "debug_intermediate_results")
                 if os.path.exists(debug_dir):
                     print(f"[DEBUG] Intermediate results saved in: {debug_dir}")
-                    self._list_saved_files(debug_dir)
             
             return score
             
@@ -248,31 +247,7 @@ class OptunaObjective:
                 try:
                     shutil.rmtree(trial_dir)
                 except:
-                    pass
-                
-    def _list_saved_files(self, debug_dir: str):
-        parquet_files = [f for f in os.listdir(debug_dir) if f.endswith('.parquet')]
-        json_files = [f for f in os.listdir(debug_dir) if f.endswith('.json')]
-        
-        print(f"[DEBUG] Found {len(parquet_files)} parquet files and {len(json_files)} JSON files")
-        
-        if parquet_files:
-            print("[DEBUG] Parquet files:")
-            for pf in sorted(parquet_files):
-                file_path = os.path.join(debug_dir, pf)
-                file_size = os.path.getsize(file_path) / 1024
-                try:
-                    df = pd.read_parquet(file_path)
-                    print(f"  - {pf} ({file_size:.1f} KB, {len(df)} rows, columns: {list(df.columns)[:5]}...)")
-                except:
-                    print(f"  - {pf} ({file_size:.1f} KB)")
-        
-        if json_files:
-            print("[DEBUG] JSON files:")
-            for jf in sorted(json_files):
-                file_size = os.path.getsize(os.path.join(debug_dir, jf)) / 1024
-                print(f"  - {jf} ({file_size:.1f} KB)")
-    
+                    pass    
                 
     def _clean_params(self, params: Dict[str, Any]):
         params_to_remove = [

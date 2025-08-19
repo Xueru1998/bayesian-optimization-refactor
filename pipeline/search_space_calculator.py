@@ -492,16 +492,20 @@ class CombinationCalculator:
         return generator_combinations if generator_combinations > 0 else 1
     
     def _calculate_prompt_gen_from_search_space(self, search_space: Dict[str, Any]) -> int:
-        
         prompt_methods = search_space.get('prompt_maker_method', ['fstring'])
         prompt_indices = search_space.get('prompt_template_idx', [0])
         generator_configs = search_space.get('generator_config', [])
         temperatures = search_space.get('generator_temperature', [])
-        
+
+        if isinstance(prompt_indices, tuple) and len(prompt_indices) == 2:
+            start, end = prompt_indices
+            prompt_indices = list(range(start, end + 1))
+
         prompt_combinations = len(prompt_methods) * len(prompt_indices)
         gen_combinations = len(generator_configs) * len(temperatures) if generator_configs and temperatures else 1
-        
+
         return prompt_combinations * gen_combinations
+
     
     def _get_top_k_values(self, top_k_config: Any) -> List[int]:
         
@@ -660,9 +664,7 @@ class CombinationCalculator:
         note: str,
         search_space: Dict[str, Any] = None
     ) -> None:
-        """
-        Print detailed information about combination calculation.
-        """
+
         print(f"\n[{component}] Combination Calculation:")
         print(f"  Search Type: {self.search_type.upper()}")
         print(f"  Total Combinations: {combinations:,}")
@@ -687,7 +689,6 @@ class CombinationCalculator:
                     for param_name, param_info in continuous_params:
                         range_str = f"[{param_info['range'][0]}, {param_info['range'][1]}]"
                         print(f"    - {param_name}: {range_str}")
-                        print(f"      Estimated points: {param_info['count']} ({param_info.get('note', '')})")
                 
                 if categorical_params:
                     print(f"\n  Categorical parameters (discrete choices):")

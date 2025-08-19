@@ -23,14 +23,8 @@ class SMACConfigSpaceBuilder:
         non_pass_reranker_configs = []
 
         if 'passage_reranker_method' in unified_space:
-            print(f"\n[ConfigSpaceBuilder DEBUG] Processing passage_reranker_method")
             unified_params = self.config_generator.extract_unified_parameters('passage_reranker')
             models_by_method = unified_params.get('models', {})
-            
-            print(f"  Methods found: {list(unified_space['passage_reranker_method']['values'])}")
-            print(f"  Models by method:")
-            for method, models in models_by_method.items():
-                print(f"    {method}: {models}")
 
             reranker_config_values = []
             
@@ -45,14 +39,10 @@ class SMACConfigSpaceBuilder:
                         config_str = f"{method}::{model}"
                         reranker_config_values.append(config_str)
                         non_pass_reranker_configs.append(config_str)
-                    print(f"    Added {len(models_by_method[method])} configs for {method}")
                 else:
                     reranker_config_values.append(method)
                     non_pass_reranker_configs.append(method)
                     print(f"    No models found for {method}, using method name only")
-
-            print(f"\n  Total reranker_config values created: {len(reranker_config_values)}")
-            print(f"  Sample values: {reranker_config_values[:5]}...")
 
             unified_space['reranker_config'] = {
                 'type': 'categorical',
@@ -60,7 +50,6 @@ class SMACConfigSpaceBuilder:
             }
 
             del unified_space['passage_reranker_method']
-            print(f"  Replaced passage_reranker_method with reranker_config")
 
             if 'reranker_top_k' in unified_space and unified_space['reranker_top_k'].get('condition'):
                 condition = unified_space['reranker_top_k']['condition']
@@ -83,7 +72,6 @@ class SMACConfigSpaceBuilder:
                     ('retrieval_method', ['vectordb'])
                 ]
 
-        print(f"\n[ConfigSpaceBuilder DEBUG] Adding parameters to ConfigSpace:")
         for param_name, param_info in unified_space.items():
             if param_name in added_params:
                 print(f"  Skipping {param_name} - already added")
@@ -93,8 +81,6 @@ class SMACConfigSpaceBuilder:
             if param:
                 cs.add(param)
                 added_params.add(param_name)
-                if 'reranker' in param_name:
-                    print(f"  Added {param_name} to ConfigSpace")
 
         self._add_conditions(cs, unified_space)
 

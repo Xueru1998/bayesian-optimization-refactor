@@ -310,8 +310,8 @@ class UnifiedSMACRunner:
         print(f"OPTIMIZATION MODE: {args.optimization_mode.upper()}")
         print(f"{'='*60}")
         print(f"Using project root: {self.project_root}")
-        print(f"Using centralized config: {args.config_path}")
-        print(f"Using centralized project dir: {args.project_dir}")
+        print(f"Using config: {args.config_path}")
+        print(f"Using project dir: {args.project_dir}")
         print(f"Results will be saved to: {args.result_dir}")
         
         if args.optimization_mode == 'global':

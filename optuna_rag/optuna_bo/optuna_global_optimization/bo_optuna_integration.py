@@ -70,14 +70,14 @@ class BOPipelineOptimizer:
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
             
-        print(f"BO using centralized config file: {self.config_path}")
+        print(f"BO using config file: {self.config_path}")
         
         self.qa_df = qa_df
         self.corpus_df = corpus_df
         print(f"[DEBUG BOPipelineOptimizer] Has generation_gt: {'generation_gt' in qa_df.columns}")
         
         self.project_dir = Utils.get_centralized_project_dir(project_dir)
-        print(f"BO using centralized project directory: {self.project_dir}")
+        print(f"BO using project directory: {self.project_dir}")
         
         with open(self.config_path, 'r') as f:
             self.config_template = yaml.safe_load(f)

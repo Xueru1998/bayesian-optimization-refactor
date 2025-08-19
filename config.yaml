@@ -145,19 +145,6 @@ node_lines:
   - node_line_name: post_retrieve_node_line
     nodes:
       - node_type: prompt_maker
-        strategy:
-          metrics:
-            - metric_name: bleu
-            - metric_name: meteor
-            - metric_name: rouge
-            - metric_name: sem_score
-              embedding_model: openai
-          speed_threshold: 10
-          generator_modules:
-            - module_type: vllm
-              llm: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-              temperature: [0.1, 1.0]
-              max_tokens: 512
         modules:
           - module_type: fstring
             prompt:

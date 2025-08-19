@@ -485,12 +485,6 @@ class UnifiedOptunaRunner:
                 print(f"\nBest configuration by score:")
                 print(f"  Score: {best_results['best_score']:.4f}")
                 print(f"  Config: {best_results['best_score_config']}")
-            
-            if best_results.get('pareto_front'):
-                print(f"\nPareto front contains {len(best_results['pareto_front'])} solutions")
-                print("Top 3 Pareto optimal solutions:")
-                for i, solution in enumerate(best_results['pareto_front'][:3]):
-                    print(f"  {i+1}. Score: {solution['score']:.4f}, Latency: {solution['latency']:.2f}s")
         
         print(f"\nResults saved to: {args.result_dir}")
         

@@ -333,14 +333,12 @@ class ComponentwiseRAGProcessor:
                 best_parquet_path = component_dataframes['query_expansion']
                 if os.path.exists(best_parquet_path):
                     best_prev_df = pd.read_parquet(best_parquet_path)
-                    print(f"[{component}] Loaded query_expansion output with columns: {list(best_prev_df.columns)}")
                     
                     if len(best_prev_df) == len(qa_subset):
                         for col in best_prev_df.columns:
                             if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']:
                                 qa_subset[col] = best_prev_df[col]
                         best_output_loaded = True
-                        print(f"[{component}] Merged columns from query_expansion: {[col for col in best_prev_df.columns if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']]}")
 
                     trial_prev_path = os.path.join(trial_dir, "query_expansion_output.parquet")
                     best_prev_df.to_parquet(trial_prev_path)

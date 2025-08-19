@@ -4,14 +4,12 @@ import json
 import yaml
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Tuple, Union
-import wandb
+from typing import Dict, Any, List, Optional, Tuple
 
 from pipeline.config_manager import ConfigGenerator
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
-from pipeline.wandb_logger import WandBLogger
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from ..helpers.component_pipeline_manager import ComponentPipelineManager
 from ..helpers.component_search_space_builder import ComponentSearchSpaceBuilder
@@ -378,7 +376,7 @@ class BaseComponentwiseOptimizer:
         if self.n_trials_per_component:
             return self.n_trials_per_component
         
-        return min(20, max(10, len(search_space) * 3))
+        return min(5, max(10, len(search_space) * 3))
     
     def _create_trial_result(self, config_dict, score, latency, budget, budget_percentage, 
             results, component, output_parquet_path):

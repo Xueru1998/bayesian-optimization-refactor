@@ -185,58 +185,7 @@ class RAGPipelineEvaluator:
         generation_results = generation_evaluator.evaluate_from_dataframe(eval_df, qa_subset)
         return generation_results
     
-    def evaluate_prompts(self, config: Dict[str, Any], trial_dir: str, prompts_df: pd.DataFrame,
-                       working_df: pd.DataFrame, qa_subset: pd.DataFrame) -> Dict[str, Any]:
-        print(f"[Trial] Evaluating prompts with model: {config.get('prompt_maker_generator_model')}")
-        
-        prompt_maker_embedding_model = None
-        for metric in self.prompt_maker_metrics:
-            if isinstance(metric, dict) and metric.get("metric_name") == "sem_score":
-                prompt_maker_embedding_model = metric.get("embedding_model")
-                break
-                
-        prompt_evaluator = GenerationEvaluatorModule(
-            metrics=[m.get("metric_name") if isinstance(m, dict) else m for m in self.prompt_maker_metrics],
-            embedding_model_name=prompt_maker_embedding_model
-        )
-        
-        prompt_gen_config = Utils.find_generator_config(
-            self.config_generator, 
-            "prompt_maker", 
-            config.get('prompt_maker_generator_model')
-        )
-        
-        prompt_generator = Utils.create_generator_from_config(
-            config.get('prompt_maker_generator_model'),
-            prompt_gen_config
-        )
-
-        temperature = Utils.get_temperature_from_config(config, prompt_gen_config, 'prompt_maker_temperature')
-        
-        prompt_eval_df = prompt_generator.generate_from_dataframe(
-            df=prompts_df,
-            prompt_column='prompts',
-            output_column='prompt_generated_texts',
-            temperature=temperature
-        )
-        
-        prompt_eval_data = pd.DataFrame()
-        prompt_eval_data['query'] = qa_subset['query'].values
-        prompt_eval_data['generated_texts'] = prompt_eval_df['prompt_generated_texts'].values
-        
-        if 'generation_gt' in qa_subset.columns:
-            prompt_eval_data['generation_gt'] = qa_subset['generation_gt'].values
-        elif 'ground_truth' in qa_subset.columns:
-            prompt_eval_data['generation_gt'] = qa_subset['ground_truth'].values
-        
-        prompt_eval_data['retrieved_contents'] = working_df['retrieved_contents'].values
-        prompt_eval_data['prompts'] = prompts_df['prompts'].values
-        
-        prompt_results = prompt_evaluator.evaluate_from_dataframe(prompt_eval_data, qa_subset)
-        print(f"Prompt evaluation results: {prompt_results}")
-    
-        return prompt_results
-    
+ 
     def calculate_combined_score(self, last_retrieval_score: float, generation_score: float, 
                                has_generator: bool, use_ragas_score: bool = False, 
                                ragas_score: float = 0.0) -> float:

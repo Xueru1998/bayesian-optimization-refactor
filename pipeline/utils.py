@@ -227,9 +227,9 @@ class Utils:
         for key, df, file_path in data_config:
             if df is not None and not os.path.exists(file_path):
                 df.to_parquet(file_path)
-                print(f"Saved {key} to centralized location: {file_path}")
+                print(f"Saved {key} to: {file_path}")
             else:
-                print(f"Using existing {key} at centralized location: {file_path}")
+                print(f"Using existing {key} at: {file_path}")
             paths[key] = file_path
             
         return paths

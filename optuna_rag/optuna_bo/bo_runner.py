@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 import wandb
 from pipeline.utils import Utils
 from optuna_rag.optuna_bo.optuna_global_optimization.bo_optuna_integration import BOPipelineOptimizer
-from optuna_rag.optuna_bo.optuna_local_optimization.componentwise_optuna_optimizer import ComponentwiseOptunaOptimizer
+from optuna_rag.optuna_bo.optuna_local_optimization.optimizers.componentwise_bayesian_optimization import ComponentwiseOptunaOptimizer
 from pipeline.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
 
 
@@ -17,7 +17,7 @@ class UnifiedOptunaRunner:
         self.parser = self._create_parser()
         self.project_root = Utils.find_project_root()
         self.wandb_project_global = "BO & AutoRAG"
-        self.wandb_project_componentwise = "Component-wise RAG Optimization"
+        self.wandb_project_componentwise = "Componentwise Optimization"
         self.wandb_entity = None
     
     def _create_parser(self) -> argparse.ArgumentParser:
@@ -50,8 +50,8 @@ class UnifiedOptunaRunner:
         parser.add_argument('--no_wandb', action='store_true',
                            help='Disable Weights & Biases tracking')
         parser.add_argument('--sampler', type=str, default='tpe', 
-                            choices=['tpe', 'botorch', 'random', 'grid'],
-                            help='Sampler to use for optimization (default: tpe)')
+                           choices=['tpe','botorch', 'random', 'grid'],
+                           help='Sampler to use for optimization (default: tpe)')
         parser.add_argument('--wandb_run_name', type=str, default=None,
                            help='Custom name for the W&B run (default: same as study_name)')
         parser.add_argument('--seed', type=int, default=42,
@@ -74,6 +74,14 @@ class UnifiedOptunaRunner:
                            choices=['context_precision', 'context_recall', 'answer_relevancy', 
                                    'faithfulness', 'factual_correctness', 'semantic_similarity'],
                            help='Specific RAGAS metrics to use (default: all)')
+        
+        # LLM Evaluator arguments 
+        parser.add_argument('--use_llm_evaluator', action='store_true', default=False,
+                           help='Use LLM-based evaluation for passage compressor')
+        parser.add_argument('--llm_evaluator_model', type=str, default='gpt-4o',
+                           help='LLM model to use for compressor evaluation (default: gpt-4o)')
+        parser.add_argument('--llm_evaluator_temperature', type=float, default=0.0,
+                           help='Temperature for LLM evaluator (default: 0.0)')
         
         # Component-wise optimization specific arguments
         parser.add_argument('--n_trials_per_component', type=int, default=20,
@@ -98,13 +106,12 @@ class UnifiedOptunaRunner:
                            help='SMTP server address')
         parser.add_argument('--smtp_port', type=int, default=587,
                            help='SMTP server port')
+        parser.add_argument('--disable_early_stopping', action='store_true',
+                    help='Disable early stopping for low-scoring components')
         
-        parser.add_argument('--use_llm_compressor_evaluator', action='store_true', default=False,
-                    help='Use LLM-based evaluation for passage compression (default: False)')
-        parser.add_argument('--llm_evaluator_model', type=str, default='gpt-4o',
-                            help='LLM model to use for compression evaluation (default: gpt-4o)')
-        parser.add_argument('--resume_study', action='store_true', default=False,
-                   help='Resume previous optimization study if it exists')
+        parser.add_argument('--resume', action='store_true', default=False,
+                   help='Resume previous optimization from where it left off')
+        
         return parser
     
     def _normalize_weights(self, retrieval_weight: float, generation_weight: float) -> tuple:
@@ -116,8 +123,7 @@ class UnifiedOptunaRunner:
     def _resolve_paths(self, args) -> None:
         args.config_path = Utils.get_centralized_config_path(args.config_path)
         args.project_dir = Utils.get_centralized_project_dir(args.project_dir)
-        
-        # Set default result directory based on mode
+
         if args.result_dir is None:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             if args.mode in ['componentwise', 'component-wise']:
@@ -182,7 +188,7 @@ class UnifiedOptunaRunner:
         sampler_info = {
             "tpe": {
                 "name": "Tree-structured Parzen Estimator (TPE)",
-                "description": "Suitable for conditional parameters and mixed search spaces",
+                "description": "suitable for conditional parameters and mixed search spaces",
                 "best_for": "RAG pipelines with many conditional parameters"
             },
             "botorch": {
@@ -196,12 +202,11 @@ class UnifiedOptunaRunner:
                 "description": "Simple baseline for comparison",
                 "best_for": "Quick exploration or baseline comparison"
             },
-            "grid": {
-                "name": "Grid Search",
-                "description": "Exhaustive search over all parameter combinations",
-                "best_for": "Small search spaces or when complete exploration is needed",
-                "note": "Only available for component-wise optimization. Uses boundary values for ranges."
-            }
+              "grid": {
+            "name": "Grid Search",
+            "description": "Exhaustive search through all parameter combinations",
+            "best_for": "Small search spaces or when you need to explore all possibilities"
+        }
         }
         
         info = sampler_info.get(optimizer, sampler_info["tpe"])
@@ -218,10 +223,12 @@ class UnifiedOptunaRunner:
                 print("Component-wise optimization evaluates each component separately")
                 return False
 
-        if args.sampler == 'grid' and args.mode not in ['componentwise', 'component-wise']:
-            print("ERROR: Grid search is only supported in component-wise mode")
-            print("For global optimization, please use 'tpe', 'botorch', or 'random'")
-            return False
+        if args.use_llm_evaluator:
+            if args.use_ragas:
+                print("WARNING: Both RAGAS and LLM evaluator are enabled. LLM evaluator will be used for compressor component.")
+            print(f"LLM Evaluator enabled for compressor evaluation")
+            print(f"  Model: {args.llm_evaluator_model}")
+            print(f"  Temperature: {args.llm_evaluator_temperature}")
         
         return True
     
@@ -230,7 +237,7 @@ class UnifiedOptunaRunner:
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
     
-    def _run_global_optimization(self, args, qa_df, corpus_df) -> Any:  # Changed return type
+    def _run_global_optimization(self, args, qa_df, corpus_df) -> Dict[str, Any]:
         print("\n===== Starting Global Bayesian Optimization =====")
         self._print_sampler_info(args.sampler)
         
@@ -247,9 +254,19 @@ class UnifiedOptunaRunner:
         if args.use_ragas:
             print("RAGAS evaluation enabled")
         
+        if args.use_llm_evaluator:
+            print("LLM Evaluator enabled for compressor component")
+        
         wandb_run_name = args.wandb_run_name or args.study_name
         if not wandb_run_name:
             wandb_run_name = f"bo_{args.sampler}_{int(time.time())}"
+
+        llm_evaluator_config = None
+        if args.use_llm_evaluator:
+            llm_evaluator_config = {
+                "llm_model": args.llm_evaluator_model,
+                "temperature": args.llm_evaluator_temperature
+            }
         
         optimizer = BOPipelineOptimizer(
             config_path=args.config_path,
@@ -275,8 +292,9 @@ class UnifiedOptunaRunner:
             ragas_llm_model=args.ragas_llm_model,
             ragas_embedding_model=args.ragas_embedding_model,
             ragas_metrics=ragas_metrics,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
+            use_llm_compressor_evaluator=args.use_llm_evaluator,
+            llm_evaluator_config=llm_evaluator_config,
+            disable_early_stopping=args.disable_early_stopping 
         )
         
         if args.n_trials:
@@ -287,19 +305,19 @@ class UnifiedOptunaRunner:
         
         return optimizer
     
-    
     def _run_componentwise_optimization(self, args, qa_df, corpus_df) -> ComponentwiseOptunaOptimizer:
         print("\n===== Starting Component-wise Bayesian Optimization =====")
-        if args.sampler == 'grid':
-            print("Using GRID SEARCH - Exhaustive exploration of all parameter combinations")
-            print("Note: This will override n_trials_per_component setting")
-            print("      Each component will be evaluated with ALL possible combinations")
-        else:
-            print(f"Using {args.sampler.upper()} optimization")
-            self._print_sampler_info(args.sampler)
-            
+        self._print_sampler_info(args.sampler)
+
         config_template = self._load_config_template(args.config_path)
         use_multi_objective = True if args.mode == 'componentwise' else args.use_multi_objective
+
+        llm_evaluator_config = None
+        if args.use_llm_evaluator:
+            llm_evaluator_config = {
+                "llm_model": args.llm_evaluator_model,
+                "temperature": args.llm_evaluator_temperature
+            }
         
         optimizer = ComponentwiseOptunaOptimizer(
             config_template=config_template,
@@ -314,7 +332,6 @@ class UnifiedOptunaRunner:
             use_cached_embeddings=args.use_cached_embeddings,
             result_dir=args.result_dir,
             study_name=args.study_name,
-            resume_study=args.resume_study, 
             walltime_limit_per_component=args.walltime_limit_per_component,
             n_workers=args.n_workers,
             seed=args.seed,
@@ -324,23 +341,18 @@ class UnifiedOptunaRunner:
             wandb_entity=self.wandb_entity,
             optimizer=args.sampler,
             use_multi_objective=use_multi_objective,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
+            use_llm_compressor_evaluator=args.use_llm_evaluator, 
+            llm_evaluator_config=llm_evaluator_config,
+            resume_study=args.resume   
         )
         
         print("\nComponent-wise optimization settings:")
-        if args.resume_study:
-            print(f"  📂 Resume: ENABLED (will continue from previous state if found)")
-        if args.sampler == 'grid':
-            print(f"  Search method: GRID SEARCH (exhaustive)")
-            print(f"  Trials per component: ALL combinations")
-        else:
-            print(f"  Trials per component: {args.n_trials_per_component}")
+        print(f"  Trials per component: {args.n_trials_per_component}")
         print(f"  Walltime limit per component: {args.walltime_limit_per_component if args.walltime_limit_per_component else 'None (no limit)'}")
         print(f"  Multi-objective: {use_multi_objective}")
         print(f"  Early stopping threshold: {args.early_stopping_threshold}")
-        if args.use_llm_compressor_evaluator:
-            print(f"  LLM Compressor Evaluator: Enabled (model: {args.llm_evaluator_model})")
+        if args.use_llm_evaluator:
+            print(f"  LLM Evaluator: Enabled for compressor component")
         print("\nNote: Component-wise optimization will:")
         print("  - Optimize each component sequentially")
         print("  - Skip retrieval if query expansion is active")
@@ -365,9 +377,6 @@ class UnifiedOptunaRunner:
         self._resolve_paths(args)
         
         print(f"Using optimization mode: {args.mode.upper()}")
-        print(f"Using project root: {self.project_root}")
-        print(f"Using config file: {args.config_path}")
-        print(f"Using project directory: {args.project_dir}")
         
         self._validate_project_dir(args.project_dir)
         

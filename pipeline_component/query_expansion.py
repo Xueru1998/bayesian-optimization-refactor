@@ -53,38 +53,8 @@ class BaseQueryExpansion(ABC):
 
 class PassQueryExpansion(BaseQueryExpansion):
     
-    def __init__(self, project_dir: Union[str, Path] = "", **kwargs):
-        self.project_dir = project_dir
-        logger.info(f"Initialize query expansion node - {self.__class__.__name__} module...")
-    
-    def __del__(self):
-        logger.info(f"Delete query expansion node - {self.__class__.__name__} module...")
-    
     def _pure(self, queries: List[str], **kwargs) -> List[List[str]]:
         return [[query] for query in queries]
-    
-    def pure(self, previous_result: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        logger.info(f"Running query expansion node - {self.__class__.__name__} module...")
-        
-        assert "query" in previous_result.columns, "previous_result must have query column."
-        queries = previous_result["query"].tolist()
-        
-        expanded_queries = self._pure(queries, **kwargs)
-        expanded_queries = self._check_expanded_query(queries, expanded_queries)
-        
-        result_df = previous_result.copy()
-        result_df["queries"] = expanded_queries
-        return result_df
-    
-    def run_evaluator(self, project_dir: str, previous_result: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        return self.pure(previous_result, **kwargs)
-    
-    @staticmethod
-    def _check_expanded_query(queries: List[str], expanded_queries: List[List[str]]) -> List[List[str]]:
-        return [
-            [expanded.strip() if expanded.strip() else query for expanded in expanded_list]
-            for query, expanded_list in zip(queries, expanded_queries)
-        ]
 
 
 class HyDE(BaseQueryExpansion):
@@ -113,15 +83,17 @@ class HyDE(BaseQueryExpansion):
 
 class QueryDecompose(BaseQueryExpansion):
     
-    DEFAULT_PROMPT = """Decompose a question into sub-questions. Output ONLY numbered sub-questions, no explanations.
+    DEFAULT_PROMPT = """Decompose a question or a statement into self-contained sub-questions. These sub-questions should help in retrieving relevant factual information to understand or verify the original input. Use "The input needs no decomposition" if it is already atomic.
 
     Example 1:
     Input: Is Hamlet more common on IMDB than Comedy of Errors?
+    Decompositions:
     1: How many listings of Hamlet are there on IMDB?
     2: How many listings of Comedy of Errors are there on IMDB?
 
     Example 2:
     Input: Treatment with a protein named FN impairs regenerative abilities of aged muscles.
+    Decompositions:
     1: What is the protein named FN?
     2: How does FN affect muscle regeneration?
     3: What is known about regenerative abilities in aged muscles?
@@ -129,16 +101,20 @@ class QueryDecompose(BaseQueryExpansion):
 
     Example 3:
     Input: Are birds important to badminton?
+    Decompositions:
     The input needs no decomposition
 
     Example 4:
     Input: A licensed child driving a Mercedes-Benz is employed in the US.
+    Decompositions:
     1: What is the minimum legal driving age in the US?
     2: What is the legal age to be employed in the US?
 
+    Example 5:
     Input: {question}
-    Output:""" 
-        
+    Decompositions:
+    """
+    
     def _pure(self, queries: List[str], **kwargs) -> List[List[str]]:
         prompt_template = kwargs.get("prompt", self.DEFAULT_PROMPT)
         
@@ -166,7 +142,7 @@ class QueryDecompose(BaseQueryExpansion):
     
     @staticmethod
     def _parse_decomposition(query: str, answer: str) -> List[str]:
-        if "the question needs no decomposition" in answer.lower() or "the input needs no decomposition" in answer.lower():
+        if "the question needs no decomposition" in answer.lower():
             return [query]
         
         try:
@@ -193,18 +169,12 @@ class QueryDecompose(BaseQueryExpansion):
 class MultiQueryExpansion(BaseQueryExpansion):
     
     DEFAULT_PROMPT = """You are an AI language model assistant.
-Your task is to generate 3 different versions of the given user
-question to retrieve relevant documents from a hybrid retrieval system
-that uses both semantic search and keyword matching (BM25).
-By generating multiple perspectives on the user question,
-your goal is to help overcome limitations of both search methods:
-- Include variations with synonyms and related terms for better keyword matching
-- Rephrase the question from different angles for semantic understanding
-- Consider both specific keywords and conceptual meanings
-
-Provide these alternative questions separated by newlines. Generate EXACTLY 3 alternative versions of the given question. Output ONLY the 3 questions, one per line, no explanations or numbering.
-Original question: {query}"""
-
+    Your task is to generate 3 different versions of the given user
+    question to retrieve relevant documents from a vector database.
+    By generating multiple perspectives on the user question,
+    your goal is to help the user overcome some of the limitations
+    of distance-based similarity search. Provide these alternative
+    questions separated by newlines. Original question: {query}"""
     
     def _pure(self, queries: List[str], **kwargs) -> List[List[str]]:
         prompt_template = kwargs.get("prompt", self.DEFAULT_PROMPT)
@@ -266,178 +236,33 @@ def create_query_expansion(module_type: str, project_dir: str, **kwargs) -> Base
     return expansion_classes[module_type](project_dir, **kwargs)
 
 
-class QueryExpansionModule:
-    def __init__(self, project_dir: str = ""):
-        self.project_dir = project_dir
-        
-        self.expanders = {
-            "pass_query_expansion": PassQueryExpansion,
-            "query_decompose": QueryDecompose,
-            "hyde": HyDE,
-            "multi_query_expansion": MultiQueryExpansion
-        }
-        
-        self.default_prompts = {
-            "hyde": "Please write a passage to answer the question. Output ONLY the answer passage, no explanations.",
-            "query_decompose": QueryDecompose.DEFAULT_PROMPT,
-            "multi_query_expansion": MultiQueryExpansion.DEFAULT_PROMPT
-        }
+if __name__ == "__main__":
+    sample_df = pd.DataFrame({
+        "query": [
+            "What are the benefits of exercise?",
+            "How does climate change affect biodiversity?"
+        ]
+    })
     
-    def create_expander(self, method: str, **kwargs) -> BaseQueryExpansion:
-        if method not in self.expanders:
-            raise ValueError(f"Unknown query expansion method: {method}. Available methods: {list(self.expanders.keys())}")
-        
-        expander_class = self.expanders[method]
-        return expander_class(project_dir=self.project_dir, **kwargs)
+    hyde_config = {
+        "generator_module_type": "sap_api",
+        "llm": "mistralai",
+        "model": "mistralai-large-instruct",
+        "api_url": "https://api.ai.internalprod.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/d2c244844b703dc4/chat/completions",
+        "bearer_token": "eyJhbGciOiJSUzI1NiIsImprdSI6Imh0dHBzOi8vc2FwdHVtZW50ZXJwcmlzZWFpLTV2OHkyZjk0LmF1dGhlbnRpY2F0aW9uLnNhcC5oYW5hLm9uZGVtYW5kLmNvbS90b2tlbl9rZXlzIiwia2lkIjoiZGVmYXVsdC1qd3Qta2V5LTM3N2M0MDBiYTkiLCJ0eXAiOiJKV1QiLCJqaWQiOiAiOGZxamh0ZEpiNHVPMW0zUGtZYTZuM3BnK3ZoS21GQXlrQy8vYVhYaStGdz0ifQ.eyJqdGkiOiIzZjJiNjg5NTE0YjE0MjkxYmNlMThkMDc3ZGFhMmRhMiIsImV4dF9hdHRyIjp7ImVuaGFuY2VyIjoiWFNVQUEiLCJzdWJhY2NvdW50aWQiOiI4YjBkZGQ5Ny1mZTZiLTQ1ZjQtODc4Zi04NjMzNjc4MTFjM2IiLCJ6ZG4iOiJzYXB0dW1lbnRlcnByaXNlYWktNXY4eTJmOTQiLCJzZXJ2aWNlaW5zdGFuY2VpZCI6ImIyMTI2ZjZlLTBlZTUtNDk3My1iNmMxLWMzYmZjNGQzODg0OCJ9LCJzdWIiOiJzYi1iMjEyNmY2ZS0wZWU1LTQ5NzMtYjZjMS1jM2JmYzRkMzg4NDghYjE5NTc2Mnx4c3VhYV9zdGQhYjc3MDg5IiwiYXV0aG9yaXRpZXMiOlsieHN1YWFfc3RkIWI3NzA4OS5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5Lm5vZGVzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuYXJ0aWZhY3RzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZGVwbG95bWVudHMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnJlc291cmNlZ3JvdXAud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5LmRlcGxveW1lbnRzLmxvZ3MucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LmFwcGxpY2F0aW9ucy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmV4ZWN1dGlvbnMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnByZWRpY3QiLCJ4c3VhYV9zdGQhYjc3MDg5LmFwcGxpY2F0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZXhlY3V0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuYXJ0aWZhY3RzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5leGVjdXRhYmxlcy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zZXJ2aWNlcy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zZWNyZXRzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5vYmplY3RzdG9yZXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuZXhlY3V0aW9ucy5sb2dzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5tZXRyaWNzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zZWNyZXRzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5tZXRyaWNzLnJlYWQiLCJ1YWEucmVzb3VyY2UiLCJ4c3VhYV9zdGQhYjc3MDg5LmtwaXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkucmVwb3NpdG9yaWVzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5yZXBvc2l0b3JpZXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuZGF0YXNldHMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5Lm5vZGVzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5Lm1ldGEucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkubG9ncy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5yZXNvdXJjZWdyb3VwLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5jb25maWd1cmF0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5kYXRhc2V0cy5kb3dubG9hZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLnByb21wdFRlbXBsYXRlcy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLnJlYWQiXSwic2NvcGUiOlsieHN1YWFfc3RkIWI3NzA4OS5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5Lm5vZGVzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuYXJ0aWZhY3RzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZGVwbG95bWVudHMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnJlc291cmNlZ3JvdXAud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5LmRlcGxveW1lbnRzLmxvZ3MucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LmFwcGxpY2F0aW9ucy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmV4ZWN1dGlvbnMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnByZWRpY3QiLCJ4c3VhYV9zdGQhYjc3MDg5LmFwcGxpY2F0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZXhlY3V0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuYXJ0aWZhY3RzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5leGVjdXRhYmxlcy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zZXJ2aWNlcy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5zZWNyZXRzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5vYmplY3RzdG9yZXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuZXhlY3V0aW9ucy5sb2dzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5tZXRyaWNzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zZWNyZXRzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5tZXRyaWNzLnJlYWQiLCJ1YWEucmVzb3VyY2UiLCJ4c3VhYV9zdGQhYjc3MDg5LmtwaXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkucmVwb3NpdG9yaWVzLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5yZXBvc2l0b3JpZXMucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkuZGF0YXNldHMud3JpdGUiLCJ4c3VhYV9zdGQhYjc3MDg5Lm5vZGVzLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5Lm1ldGEucmVhZCIsInhzdWFhX3N0ZCFiNzcwODkubG9ncy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5yZXNvdXJjZWdyb3VwLnJlYWQiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5jb25maWd1cmF0aW9ucy5yZWFkIiwieHN1YWFfc3RkIWI3NzA4OS5kYXRhc2V0cy5kb3dubG9hZCIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLnByb21wdFRlbXBsYXRlcy53cml0ZSIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLndyaXRlIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLnJlYWQiXSwiY2xpZW50X2lkIjoic2ItYjIxMjZmNmUtMGVlNS00OTczLWI2YzEtYzNiZmM0ZDM4ODQ4IWIxOTU3NjJ8eHN1YWFfc3RkIWI3NzA4OSIsImNpZCI6InNiLWIyMTI2ZjZlLTBlZTUtNDk3My1iNmMxLWMzYmZjNGQzODg0OCFiMTk1NzYyfHhzdWFhX3N0ZCFiNzcwODkiLCJhenAiOiJzYi1iMjEyNmY2ZS0wZWU1LTQ5NzMtYjZjMS1jM2JmYzRkMzg4NDghYjE5NTc2Mnx4c3VhYV9zdGQhYjc3MDg5IiwiZ3JhbnRfdHlwZSI6ImNsaWVudF9jcmVkZW50aWFscyIsInJldl9zaWciOiJhYjVlYjAwIiwiaWF0IjoxNzUyMjM4MTMxLCJleHAiOjE3NTIyODEzMzEsImlzcyI6Imh0dHBzOi8vc2FwdHVtZW50ZXJwcmlzZWFpLTV2OHkyZjk0LmF1dGhlbnRpY2F0aW9uLnNhcC5oYW5hLm9uZGVtYW5kLmNvbS9vYXV0aC90b2tlbiIsInppZCI6IjhiMGRkZDk3LWZlNmItNDVmNC04NzhmLTg2MzM2NzgxMWMzYiIsImF1ZCI6WyJ4c3VhYV9zdGQhYjc3MDg5LmtwaXMiLCJ4c3VhYV9zdGQhYjc3MDg5LmRhdGFzZXRzIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5jb25maWd1cmF0aW9ucyIsInhzdWFhX3N0ZCFiNzcwODkubWV0YSIsInhzdWFhX3N0ZCFiNzcwODkucmVwb3NpdG9yaWVzIiwieHN1YWFfc3RkIWI3NzA4OS5ub2RlcyIsInhzdWFhX3N0ZCFiNzcwODkuZXhlY3V0aW9ucy5sb2dzIiwieHN1YWFfc3RkIWI3NzA4OS5hcHBsaWNhdGlvbnMiLCJ1YWEiLCJ4c3VhYV9zdGQhYjc3MDg5LnJlc291cmNlZ3JvdXAiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5leGVjdXRpb25zY2hlZHVsZXMiLCJ4c3VhYV9zdGQhYjc3MDg5LnNlcnZpY2VzIiwieHN1YWFfc3RkIWI3NzA4OS5sb2dzIiwieHN1YWFfc3RkIWI3NzA4OS5vYmplY3RzdG9yZXNlY3JldC5jcmVkZW50aWFscyIsInhzdWFhX3N0ZCFiNzcwODkuZGVwbG95bWVudHMubG9ncyIsInNiLWIyMTI2ZjZlLTBlZTUtNDk3My1iNmMxLWMzYmZjNGQzODg0OCFiMTk1NzYyfHhzdWFhX3N0ZCFiNzcwODkiLCJ4c3VhYV9zdGQhYjc3MDg5LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MuZGVwbG95bWVudHMiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMiLCJ4c3VhYV9zdGQhYjc3MDg5LnNlY3JldHMiLCJ4c3VhYV9zdGQhYjc3MDg5LnNjZW5hcmlvcy5leGVjdXRpb25zIiwieHN1YWFfc3RkIWI3NzA4OS5zY2VuYXJpb3MubWV0cmljcyIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmFydGlmYWN0cyIsInhzdWFhX3N0ZCFiNzcwODkuc2NlbmFyaW9zLmV4ZWN1dGFibGVzIl19.siY40299UCcuDQXLUbnuS3zIM0la_iOcBQnbb8ZvWEx6Oxro4sB-6Z-M8lq-zATGVZMSu77iXuUusvJPDZpjrNzl7EEY5fx84DfGYGbLwc6AzDIA7_8yYkJEFZlY0lhh-YpWQUEPwG4gs6Utib7JejXbvLUP0Te561-295lpFlAOEBNkCvGovfVgFNsf0KusuGfiG0cQI0aStLw-VuGUtPqVo-8fsQGRGyq2ZSioytaAPKbrg6m8fJnfHxdG9DncMbdfOy1AP7GdCvdSPjwZV8QVZYChHlRJjOrLz1pK8jSad2BNsYBa9IqraJv7NTMEDQNC_-IsBbvUdRZFAWQ6uw",
+        "max_token": 128,
+        "temperature": 0.7
+    }
     
-    def expand_queries(self, 
-                       df: pd.DataFrame, 
-                       method: str = "pass_query_expansion", 
-                       **kwargs) -> pd.DataFrame:
-        if "query" not in df.columns:
-            raise ValueError("DataFrame must have 'query' column")
-
-        init_params = {}
-        operation_params = {}
-        
-        if 'generator_module_type' in kwargs:
-            init_params['generator_module_type'] = kwargs.pop('generator_module_type')
-        if 'llm' in kwargs:
-            init_params['llm'] = kwargs.pop('llm')
-        if 'model' in kwargs:
-            init_params['model'] = kwargs.pop('model')
-        if 'batch' in kwargs:
-            init_params['batch'] = kwargs.pop('batch')
-
-        queries = df['query'].tolist()
-
-        expander = self.create_expander(method, **init_params)
-        
-        try:
-            if method == "pass_query_expansion":
-                expanded_queries = [[query] for query in queries]
-                
-            elif method == "query_decompose":
-                prompt = kwargs.pop('prompt', self.default_prompts.get('query_decompose'))
-                expanded_queries = expander._pure(queries, prompt=prompt, **kwargs)
-                
-            elif method == "hyde":
-                prompt = kwargs.pop('prompt', self.default_prompts.get('hyde'))
-                if 'max_token' in kwargs:
-                    kwargs['max_tokens'] = kwargs.pop('max_token')
-                expanded_queries = expander._pure(queries, prompt=prompt, **kwargs)
-                
-            elif method == "multi_query_expansion":
-                prompt = kwargs.pop('prompt', self.default_prompts.get('multi_query_expansion'))
-                expanded_queries = expander._pure(queries, prompt=prompt, **kwargs)
-            
-            result_df = df.copy()
-            result_df['queries'] = expanded_queries
-            result_df['expanded_queries'] = expanded_queries
-            
-            return result_df
-        except Exception as e:
-            print(f"Error during query expansion: {e}")
-            import traceback
-            traceback.print_exc()
-
-            result_df = df.copy()
-            result_df['queries'] = [[query] for query in queries]
-            result_df['expanded_queries'] = [[query] for query in queries]
-            return result_df
+    hyde_expander = create_query_expansion(
+        module_type="query_decompose",
+        project_dir="./",
+        **hyde_config
+    )
     
-    def apply_expansion(self, df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        method = config.get('module_type', 'pass_query_expansion')
-        
-        expansion_params = {}
-
-        if 'generator_module_type' in config:
-            expansion_params['generator_module_type'] = config['generator_module_type']
-        if 'llm' in config:
-            expansion_params['llm'] = config['llm']
-        if 'model' in config:
-            expansion_params['model'] = config['model']
-        if 'batch' in config:
-            expansion_params['batch'] = config['batch']
-        
-        if method == 'hyde' and 'max_token' in config:
-            expansion_params['max_token'] = config['max_token']
-        if method == 'multi_query_expansion' and 'temperature' in config:
-            expansion_params['temperature'] = config['temperature']
-        
-        print(f"Applying {method} query expansion")
-        if expansion_params.get('model'):
-            print(f"Using model: {expansion_params['model']}")
-        elif expansion_params.get('llm'):
-            print(f"Using LLM: {expansion_params['llm']}")
-
-        if method == 'pass_query_expansion':
-            print("Using pass-through query expansion (no expansion)")
-            result_df = df.copy()
-            result_df['queries'] = [[query] for query in df['query'].tolist()]
-            result_df['expanded_queries'] = [[query] for query in df['query'].tolist()]
-            return result_df
-
-        try:
-            expanded_df = self.expand_queries(
-                df,
-                method=method,
-                **expansion_params
-            )
-            
-            print(f"Successfully expanded queries for {len(df)} queries")
-            return expanded_df
-            
-        except Exception as e:
-            print(f"Error during query expansion: {e}")
-            import traceback
-            traceback.print_exc()
-            print("Returning original queries due to error")
-            
-            result_df = df.copy()
-            result_df['queries'] = [[query] for query in df['query'].tolist()]
-            result_df['expanded_queries'] = [[query] for query in df['query'].tolist()]
-            return result_df
-    
-    def perform_query_expansion(self, df: pd.DataFrame, config: Dict[str, Any]) -> tuple:
-        expanded_df = self.apply_expansion(df, config)
-        expanded_queries = expanded_df['expanded_queries'].tolist()
-        
-        return expanded_df, expanded_queries
-        
-    def perform_retrieval_with_expanded_queries(self, df: pd.DataFrame, retrieval_func, config: Dict[str, Any]) -> pd.DataFrame:
-        expanded_df, expanded_queries = self.perform_query_expansion(df, config)
-
-        all_queries = []
-        query_indices = []
-        
-        for i, query_list in enumerate(expanded_queries):
-            all_queries.extend(query_list)
-            query_indices.extend([i] * len(query_list))
-        
-        retrieval_df = pd.DataFrame({'query': all_queries})
-        
-        retrieved_df = retrieval_func(retrieval_df)
-        
-        result_df = df.copy()
-        result_df['queries'] = expanded_queries
-        result_df['expanded_queries'] = expanded_queries
-
-        result_df['retrieved_contents'] = [[] for _ in range(len(df))]
-        result_df['retrieved_ids'] = [[] for _ in range(len(df))]
-        result_df['retrieve_scores'] = [[] for _ in range(len(df))]
-        
-        for i, idx in enumerate(query_indices):
-            if 'retrieved_contents' in retrieved_df.columns and i < len(retrieved_df):
-                if isinstance(retrieved_df['retrieved_contents'].iloc[i], list):
-                    result_df['retrieved_contents'].iloc[idx].extend(retrieved_df['retrieved_contents'].iloc[i])
-            
-            if 'retrieved_ids' in retrieved_df.columns and i < len(retrieved_df):
-                if isinstance(retrieved_df['retrieved_ids'].iloc[i], list):
-                    result_df['retrieved_ids'].iloc[idx].extend(retrieved_df['retrieved_ids'].iloc[i])
-            
-            if 'retrieve_scores' in retrieved_df.columns and i < len(retrieved_df):
-                if isinstance(retrieved_df['retrieve_scores'].iloc[i], list):
-                    result_df['retrieve_scores'].iloc[idx].extend(retrieved_df['retrieve_scores'].iloc[i])
-        
-        return result_df
+    result = hyde_expander.pure(sample_df)
+    print("HyDE Results:")
+    for idx, queries in enumerate(result["queries"]):
+        print(f"Original: {sample_df.iloc[idx]['query']}")
+        print(f"Expanded: {queries}")
+        print("-" * 50)

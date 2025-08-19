@@ -67,39 +67,54 @@ class UnifiedSearchSpaceExtractor:
         }
         
         active_methods = [m for m in methods if m != 'pass_query_expansion']
-        if not active_methods:
-            return
         
-        all_models = []
-        for method, models in params.get('models', {}).items():
-            all_models.extend(models)
+        qe_options = []
+        option_metadata = {}
         
-        if all_models:
-            space['query_expansion_model'] = {
-                'type': 'categorical',
-                'values': list(set(all_models)),
-                'condition': ('query_expansion_method', 'in', list(params.get('models', {}).keys()))
+        if 'pass_query_expansion' in methods:
+            qe_options.append('pass_query_expansion')
+            option_metadata['pass_query_expansion'] = {
+                'method': 'pass_query_expansion',
+                'generator_module_type': None,
+                'model': None
             }
         
-        if params.get('temperatures'):
-            for method, temps in params['temperatures'].items():
-                if temps:
-                    space['query_expansion_temperature'] = {
-                        'type': 'float',
-                        'values': temps,
-                        'condition': ('query_expansion_method', 'equals', method)
-                    }
-                    break
+        for gen_config in params.get('generator_configs', []):
+            method = gen_config['method']
+            gen_type = gen_config['generator_module_type']
+            
+            for model in gen_config['models']:
+                option_key = f"{method}::{gen_type}::{model}"
+                qe_options.append(option_key)
+                
+                option_metadata[option_key] = {
+                    'method': method,
+                    'generator_module_type': gen_type,
+                    'model': model,
+                    'llm': gen_config.get('llm'),
+                    'api_url': gen_config.get('api_url')
+                }
         
-        if params.get('max_tokens'):
-            for method, tokens in params['max_tokens'].items():
-                if tokens:
-                    space['query_expansion_max_token'] = {
-                        'type': 'int',
-                        'values': tokens,
-                        'condition': ('query_expansion_method', 'equals', method)
-                    }
-                    break
+        if qe_options:
+            space['query_expansion_config'] = {
+                'type': 'categorical',
+                'values': qe_options,
+                'metadata': option_metadata
+            }
+
+        if params.get('all_temperatures'):
+            space['query_expansion_temperature'] = {
+                'type': 'float',
+                'values': params['all_temperatures'],
+                'condition': ('query_expansion_method', 'equals', 'multi_query_expansion')
+            }
+        
+        if params.get('all_max_tokens'):
+            space['query_expansion_max_token'] = {
+                'type': 'int',
+                'values': params['all_max_tokens'],
+                'condition': ('query_expansion_method', 'equals', 'hyde')
+            }
         
         retrieval_options = params.get('retrieval_options', {})
         if retrieval_options.get('methods'):
@@ -121,6 +136,7 @@ class UnifiedSearchSpaceExtractor:
                     'values': retrieval_options['vectordb_names'],
                     'condition': ('query_expansion_retrieval_method', 'equals', 'vectordb')
                 }
+
     
     def _extract_retrieval_params(self, space: Dict[str, Any]):
         params = self.config_generator.extract_unified_parameters('retrieval')
@@ -175,18 +191,24 @@ class UnifiedSearchSpaceExtractor:
                 'condition': ('passage_reranker_method', 'in', list(model_mappings.keys()))
             }
         
+        if params.get('api_endpoints'):
+            api_mappings = params['api_endpoints']
+            space['reranker_api_url'] = {
+                'type': 'categorical',
+                'method_apis': api_mappings,
+                'condition': ('passage_reranker_method', 'in', list(api_mappings.keys()))
+            }
+        
         if params.get('top_k_values'):
             retriever_max = max(space.get('retriever_top_k', {}).get('values', [10]))
             constrained_values = [min(k, retriever_max) for k in params['top_k_values']]
-            non_pass_methods = [m for m in params['methods'] if m != 'pass_reranker']
             
-            if non_pass_methods:  
-                space['reranker_top_k'] = {
-                    'type': 'int',
-                    'values': list(set(constrained_values)),
-                    'max_value': retriever_max,
-                    'condition': ('passage_reranker_method', 'not_equals', 'pass_reranker')
-                }
+            space['reranker_top_k'] = {
+                'type': 'int',
+                'values': list(set(constrained_values)),
+                'max_value': retriever_max,
+                'condition': ('passage_reranker_method', 'not_equals', 'pass_reranker')
+            }
     
     def _extract_filter_params(self, space: Dict[str, Any]):
         params = self.config_generator.extract_unified_parameters('passage_filter')
@@ -218,78 +240,91 @@ class UnifiedSearchSpaceExtractor:
         
         if not params.get('methods'):
             return
+
+        comp_options = []
+        option_metadata = {}
+        seen_configs = set()
         
-        space['passage_compressor_method'] = {
-            'type': 'categorical',
-            'values': params['methods']
-        }
+        if 'pass_compressor' in params['methods']:
+            comp_options.append('pass_compressor')
+            option_metadata['pass_compressor'] = {'method': 'pass_compressor'}
+            seen_configs.add('pass_compressor')
         
-        llm_methods = ['tree_summarize', 'refine']
+        for comp_config in params.get('compressor_configs', []):
+            method = comp_config['method']
+
+            if method in ['tree_summarize', 'refine']:
+                gen_type = comp_config['generator_module_type']
+                for model in comp_config['models']:
+                    option_key = f"{method}::{gen_type}::{model}"
+                    if option_key not in seen_configs:
+                        seen_configs.add(option_key)
+                        comp_options.append(option_key)
+                        
+                        option_metadata[option_key] = {
+                            'method': method,
+                            'generator_module_type': gen_type,
+                            'llm': comp_config.get('llm'),
+                            'model': model,
+                            'api_url': comp_config.get('api_url')
+                        }
+
+            elif method in ['lexrank', 'spacy', 'sentence_rank', 'keyword_extraction', 'query_focused']:
+                if method == 'spacy':
+                    for model in comp_config.get('spacy_model', ['en_core_web_sm']):
+                        option_key = f"{method}::{model}"
+                        if option_key not in seen_configs:
+                            seen_configs.add(option_key)
+                            comp_options.append(option_key)
+                            option_metadata[option_key] = {
+                                'method': method,
+                                'spacy_model': model
+                            }
+                else:
+                    option_key = method
+                    if option_key not in seen_configs:
+                        seen_configs.add(option_key)
+                        comp_options.append(option_key)
+                        option_metadata[option_key] = {'method': method}
         
-        if params.get('llms'):
-            space['compressor_llm'] = {
+        if comp_options:
+            space['passage_compressor_config'] = {
                 'type': 'categorical',
-                'values': params['llms'],
-                'condition': ('passage_compressor_method', 'in', llm_methods)
+                'values': comp_options,
+                'metadata': option_metadata
             }
-        
-        if params.get('models'):
-            space['compressor_model'] = {
-                'type': 'categorical',
-                'values': params['models'],
-                'condition': ('passage_compressor_method', 'in', llm_methods)
-            }
-        
-        if params.get('compression_ratios'):
-            for method, ratios in params['compression_ratios'].items():
-                if ratios:
-                    space['compressor_compression_ratio'] = {
+
+        for comp_config in params.get('compressor_configs', []):
+            method = comp_config['method']
+
+            if method in ['lexrank', 'spacy', 'sentence_rank', 'keyword_extraction', 'query_focused']:
+                if 'compression_ratio' in comp_config:
+                    space['compression_ratio'] = {
                         'type': 'float',
-                        'values': ratios,
-                        'condition': ('passage_compressor_method', 'equals', method)
+                        'values': comp_config['compression_ratio'],
+                        'condition': ('passage_compressor_config', 'contains', method)
                     }
-                    break
-        
-        if params.get('thresholds'):
-            for method, thresholds in params['thresholds'].items():
-                if thresholds and method == 'lexrank':
-                    space['compressor_threshold'] = {
+
+            if method == 'lexrank':
+                if 'threshold' in comp_config:
+                    space['lexrank_threshold'] = {
                         'type': 'float',
-                        'values': thresholds,
-                        'condition': ('passage_compressor_method', 'equals', 'lexrank')
+                        'values': comp_config['threshold'],
+                        'condition': ('passage_compressor_config', 'equals', 'lexrank')
                     }
-                    break
-        
-        if params.get('dampings'):
-            for method, dampings in params['dampings'].items():
-                if dampings and method == 'lexrank':
-                    space['compressor_damping'] = {
+                if 'damping' in comp_config:
+                    space['lexrank_damping'] = {
                         'type': 'float',
-                        'values': dampings,
-                        'condition': ('passage_compressor_method', 'equals', 'lexrank')
+                        'values': comp_config['damping'],
+                        'condition': ('passage_compressor_config', 'equals', 'lexrank')
                     }
-                    break
-        
-        if params.get('max_iterations'):
-            for method, iterations in params['max_iterations'].items():
-                if iterations and method == 'lexrank':
-                    space['compressor_max_iterations'] = {
+                if 'max_iterations' in comp_config:
+                    space['lexrank_max_iterations'] = {
                         'type': 'int',
-                        'values': iterations,
-                        'condition': ('passage_compressor_method', 'equals', 'lexrank')
+                        'values': comp_config['max_iterations'],
+                        'condition': ('passage_compressor_config', 'equals', 'lexrank')
                     }
-                    break
-        
-        if params.get('spacy_models'):
-            for method, models in params['spacy_models'].items():
-                if models and method == 'spacy':
-                    space['compressor_spacy_model'] = {
-                        'type': 'categorical',
-                        'values': models,
-                        'condition': ('passage_compressor_method', 'equals', 'spacy')
-                    }
-                    break
-    
+                    
     def _extract_prompt_maker_params(self, space: Dict[str, Any]):
         params = self.config_generator.extract_unified_parameters('prompt_maker')
         
@@ -309,24 +344,47 @@ class UnifiedSearchSpaceExtractor:
     def _extract_generator_params(self, space: Dict[str, Any]):
         params = self.config_generator.extract_unified_parameters('generator')
         
-        if params.get('models'):
-            space['generator_model'] = {
-                'type': 'categorical',
-                'values': list(set(params['models']))
-            }
+        if not params.get('module_configs'):
+            return
+
+        gen_options = []
+        option_metadata = {}
         
-        if params.get('temperatures'):
-            unique_temps = list(set(params['temperatures']))
+        for module_config in params['module_configs']:
+            module_type = module_config['module_type']
+            
+            for model in module_config['models']:
+                option_key = f"{module_type}::{model}"
+                gen_options.append(option_key)
+                
+                option_metadata[option_key] = {
+                    'module_type': module_type,
+                    'model': model,
+                    'llm': module_config.get('llm'),
+                    'api_url': module_config.get('api_url')
+                }
+        
+        if gen_options:
+            space['generator_config'] = {
+                'type': 'categorical',
+                'values': gen_options,
+                'metadata': option_metadata
+            }
+
+        if params.get('all_temperatures'):
+            unique_temps = list(set(params['all_temperatures']))
             space['generator_temperature'] = {
                 'type': 'float',
                 'values': unique_temps
             }
-        
-        if params.get('module_types') and len(set(params['module_types'])) > 1:
-            space['generator_module_type'] = {
-                'type': 'categorical',
-                'values': list(set(params['module_types']))
+
+        if params.get('all_max_tokens'):
+            space['generator_max_tokens'] = {
+                'type': 'int',
+                'values': params['all_max_tokens'],
+                'condition': ('generator_module_type', 'equals', 'sap_api')
             }
+
     
     def _get_bo_range_for_single_value(self, param_name: str, value: float, param_type: str) -> Tuple[float, float]:
         if param_type == 'int':
@@ -384,6 +442,17 @@ class UnifiedSearchSpaceExtractor:
             param_type = param_info['type']
             values = param_info.get('values', [])
             condition = param_info.get('condition')
+            metadata = param_info.get('metadata')
+
+            if metadata and param_type == 'categorical':
+                if condition:
+                    bohb_space[param_name] = tune.sample_from(
+                        lambda config, vals=values, cond=condition, meta=metadata, name=param_name: 
+                        self._evaluate_condition_with_metadata(config, cond, vals, meta, name)
+                    )
+                else:
+                    bohb_space[param_name] = tune.choice(values)
+                continue
 
             if 'method_values' in param_info:
                 bohb_space[param_name] = tune.sample_from(
@@ -391,7 +460,7 @@ class UnifiedSearchSpaceExtractor:
                     self._evaluate_method_specific_parameter(config, info, name)
                 )
                 continue
-            
+
             if param_type == 'categorical':
                 if condition:
                     bohb_space[param_name] = tune.sample_from(
@@ -593,6 +662,18 @@ class UnifiedSearchSpaceExtractor:
         else:
             return self._check_single_condition(config, condition)
     
+    def _evaluate_condition_with_metadata(self, config, condition, values, metadata, param_name):
+        if not self._check_condition(config, condition):
+            return None
+
+        if condition and len(condition) == 3 and condition[1] == 'contains':
+            filtered_values = [v for v in values if condition[2] in v]
+            if filtered_values:
+                return tune.choice(filtered_values).sample()
+            return None
+        
+        return tune.choice(values).sample()
+    
     def _check_single_condition(self, config, condition):
         if condition is None:
             return True
@@ -604,19 +685,30 @@ class UnifiedSearchSpaceExtractor:
             'equals': lambda: config_value == value,
             'not_equals': lambda: config_value != value,
             'in': lambda: config_value in value,
-            'not_in': lambda: config_value not in value
+            'not_in': lambda: config_value not in value,
+            'contains': lambda: value in str(config_value) if config_value else False
         }
         
         return condition_checks.get(op, lambda: True)()
     
     def _convert_to_optuna_grid_space(self, unified_space: Dict[str, Any]) -> Dict[str, Any]:
         grid_space = {}
+
+        composite_params = [
+            'query_expansion_config',
+            'passage_compressor_config', 
+            'generator_config'
+        ]
         
+        for param_name in composite_params:
+            if param_name in unified_space:
+                grid_space[param_name] = unified_space[param_name]['values']
+
         param_groups = [
             ('query_expansion', [
-                'query_expansion_method', 'query_expansion_model', 'query_expansion_max_token',
-                'query_expansion_temperature', 'query_expansion_retrieval_method',
-                'query_expansion_bm25_tokenizer', 'query_expansion_vectordb_name'
+                'query_expansion_method', 'query_expansion_temperature', 'query_expansion_max_token',
+                'query_expansion_retrieval_method', 'query_expansion_bm25_tokenizer', 
+                'query_expansion_vectordb_name'
             ]),
             ('retrieval', [
                 'retrieval_method', 'bm25_tokenizer', 'vectordb_name', 'retriever_top_k'
@@ -629,19 +721,18 @@ class UnifiedSearchSpaceExtractor:
             ]),
             ('prompt', [
                 'prompt_maker_method', 'prompt_template_idx'
+            ]),
+            ('generator', [
+                'generator_temperature', 'generator_max_tokens'
             ])
         ]
         
         for group_name, param_names in param_groups:
             for param_name in param_names:
-                if param_name in unified_space:
+                if param_name in unified_space and param_name not in grid_space:
                     self._add_param_to_grid_space(grid_space, param_name, unified_space[param_name])
         
         self._handle_filter_params_grid(grid_space, unified_space)
-        
-        for name, info in unified_space.items():
-            if name not in grid_space and info.get('values'):
-                grid_space[name] = info['values']
         
         return grid_space
     

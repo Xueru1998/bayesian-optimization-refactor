@@ -6,123 +6,17 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 
 from ..base.base_componentwise_optimizer import BaseComponentwiseOptimizer
+from ..helpers.component_grid_search_helper import ComponentGridSearchHelper
+from pipeline.utils import Utils
 from pipeline.wandb_logger import WandBLogger
 
 
 class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
+    """Grid Search specific implementation for componentwise optimization"""
     
-    def optimize(self) -> Dict[str, Any]:
-        start_time = time.time()
-        
-        self._validate_all_components()
-        
-        all_results = {
-            'study_name': self.study_name,
-            'component_results': {},
-            'best_configs': {},
-            'optimization_time': 0,
-            'component_order': [],
-            'early_stopped': False,
-            'retrieval_weight': self.retrieval_weight,
-            'generation_weight': self.generation_weight
-        }
-        
-        active_components = self._get_active_components()
-        
-        if self.resume_study:
-            completed_components = list(self.best_configs.keys())
-            remaining_components = [c for c in active_components if c not in completed_components]
-            
-            if not remaining_components:
-                print("\n[RESUME] All components already completed!")
-                summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
-                if os.path.exists(summary_file):
-                    with open(summary_file, 'r') as f:
-                        return json.load(f)
-                else:
-                    print("[RESUME] Warning: Summary file not found, starting fresh")
-                    self.resume_study = False
-            else:
-                print(f"\n[RESUME] Remaining components to optimize: {remaining_components}")
-                active_components = remaining_components
-        
-        for component_idx, component in enumerate(active_components):
-            if component == 'passage_filter' and 'passage_reranker' in self.best_configs:
-                reranker_config = self.best_configs['passage_reranker']
-                if reranker_config.get('reranker_top_k') == 1:
-                    print(f"\n[Component-wise] Skipping filter optimization because reranker_top_k=1")
-                    self.best_configs[component] = {'passage_filter_method': 'pass_passage_filter'}
-                    all_results['best_configs'][component] = self.best_configs[component]
-                    all_results['component_order'].append(component)
-                    
-                    all_results['component_results'][component] = {
-                        'component': component,
-                        'best_config': self.best_configs[component],
-                        'best_score': self.component_results.get('passage_reranker', {}).get('best_score', 0.0),
-                        'n_trials': 0,
-                        'optimization_time': 0.0,
-                        'skipped': True,
-                        'skip_reason': 'reranker_top_k=1'
-                    }
-                    continue
-            
-            self._setup_wandb_for_component(component, component_idx, active_components)
-            
-            component_result = self._optimize_component(
-                component, 
-                component_idx,
-                active_components
-            )
-            
-            all_results['component_results'][component] = component_result
-            all_results['best_configs'][component] = component_result['best_config']
-            all_results['component_order'].append(component)
-            
-            self.component_results[component] = component_result
-            self.best_configs[component] = component_result['best_config']
-            
-            self._save_intermediate_state()
-            
-            self._log_wandb_component_summary(component, component_result)
-        
-        all_results['optimization_time'] = time.time() - start_time
-        all_results['total_trials'] = sum(
-            comp.get('n_trials', 0) for comp in all_results['component_results'].values()
-        )
-        all_results['study_name'] = self.study_name
-        
-        self._log_wandb_final_summary(all_results)
-        
-        self._save_final_results(all_results)
-        self._print_final_summary(all_results)
-        
-        return all_results
-    
-    def _get_active_components(self) -> List[str]:
-        active_components = []
-        has_active_query_expansion = False
-        
-        for comp in self.COMPONENT_ORDER:
-            if comp == 'query_expansion' and self.config_generator.node_exists(comp):
-                qe_config = self.config_generator.extract_node_config("query_expansion")
-                qe_methods = []
-                for module in qe_config.get("modules", []):
-                    method = module.get("module_type")
-                    if method and method != "pass_query_expansion":
-                        qe_methods.append(method)
-                if qe_methods:
-                    has_active_query_expansion = True
-                    active_components.append(comp)
-            elif comp == 'retrieval' and has_active_query_expansion:
-                print("[Component-wise] Skipping retrieval component since query expansion includes retrieval")
-                continue
-            elif comp == 'prompt_maker_generator':
-                if self.config_generator.node_exists('prompt_maker') or self.config_generator.node_exists('generator'):
-                    active_components.append(comp)
-            elif self.config_generator.node_exists(comp):
-                active_components.append(comp)
-        
-        return active_components
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grid_helper = ComponentGridSearchHelper()
     
     def _optimize_component(self, component: str, component_idx: int, 
                           active_components: List[str]) -> Dict[str, Any]:
@@ -131,12 +25,6 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
         os.makedirs(component_dir, exist_ok=True)
         
         fixed_config = self._get_fixed_config(component, active_components)
-        
-        if self.use_wandb:
-            WandBLogger.log_component_optimization_start(
-                component, component_idx, len(active_components), fixed_config
-            )
-        
         search_space = self.search_space_builder.build_component_search_space(component, fixed_config)
         
         if not search_space:
@@ -165,27 +53,20 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
                         component_dir: str, fixed_config: Dict[str, Any],
                         search_space: Dict[str, Any], 
                         active_components: List[str]) -> Dict[str, Any]:
-        
-        total_combinations = self.grid_search_helper.calculate_grid_search_combinations(
-            component, search_space, fixed_config
+    
+        total_combinations, note = self.combination_calculator.calculate_component_combinations(
+            component, search_space, fixed_config, self.best_configs
         )
         
-        self.grid_search_helper.print_grid_search_info(
-            component, search_space, total_combinations, fixed_config
+        print(f"[{component}] Using GRID SEARCH for {total_combinations} combinations")
+        self.combination_calculator.print_combination_info(
+            component, total_combinations, note, search_space
         )
         
-        valid_combinations = self.grid_search_helper.get_valid_combinations(
-            component, search_space, fixed_config
-        )
+        valid_combinations = self.grid_helper.get_valid_combinations(component, search_space, fixed_config)
         
         if len(valid_combinations) != total_combinations:
             print(f"[WARNING] Mismatch: expected {total_combinations}, got {len(valid_combinations)}")
-        
-        self.grid_search_helper.save_grid_search_sequence(
-            component, valid_combinations, component_dir
-        )
-        
-        print(f"[{component}] Using GRID SEARCH with {len(valid_combinations)} combinations")
         
         self.current_component = component
         self.current_fixed_config = fixed_config
@@ -195,49 +76,44 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
         
         grid_state_file = os.path.join(component_dir, "grid_search_state.json")
         completed_configs = []
-        last_incomplete_trial = None
         
         if os.path.exists(grid_state_file):
-            completed_configs, last_incomplete_trial = self._load_grid_state(
-                grid_state_file, component_dir, component
-            )
+            completed_configs = self._load_grid_state(grid_state_file, component_dir)
         
         remaining_combinations = self._get_remaining_combinations(
-            valid_combinations, completed_configs, last_incomplete_trial
+            valid_combinations, completed_configs, component
         )
         
         print(f"[{component}] {len(remaining_combinations)} combinations remaining")
         
-        if len(remaining_combinations) > 0:
-            for i, trial_config in enumerate(remaining_combinations[:3]):
-                print(f"  Next trial {i+1}: {trial_config}")
-            if len(remaining_combinations) > 3:
-                print(f"  ... and {len(remaining_combinations) - 3} more trials")
+        if len(remaining_combinations) == 0:
+            return self._handle_completed_grid_search(component, fixed_config, total_combinations)
+        
+        self._print_next_trials(remaining_combinations)
         
         for trial_idx, trial_config in enumerate(remaining_combinations):
-            trial_completed = self._run_single_grid_trial(
-                component, trial_config, fixed_config, valid_combinations,
-                component_dir, grid_state_file, completed_configs,
-                trial_idx, last_incomplete_trial
+            result = self._run_single_grid_trial(
+                component, trial_config, fixed_config, 
+                valid_combinations, component_dir, grid_state_file,
+                completed_configs
             )
             
-            if trial_completed:
-                last_incomplete_trial = None
+            if result is None:
+                continue
         
-        return self._finalize_grid_search(
-            component, component_dir, fixed_config,
-            search_space, total_combinations
+        return self._finalize_grid_search_results(
+            component, fixed_config, total_combinations
         )
     
-    def _load_grid_state(self, grid_state_file: str, component_dir: str, 
-                         component: str) -> tuple:
+    def _load_grid_state(self, grid_state_file: str, component_dir: str) -> List[Dict]:
         with open(grid_state_file, 'r') as f:
             grid_state = json.load(f)
             completed_configs = grid_state.get('completed_configs', [])
-            self.component_trial_counter = grid_state.get('last_trial_number', 0)
-            last_incomplete_trial = grid_state.get('last_incomplete_trial', None)
-        
-        print(f"[{component}] Resuming: found {len(completed_configs)} completed trials")
+            self.component_trial_counter = len(completed_configs)
+            
+        print(f"[Grid Search] Resuming: found {len(completed_configs)} completed trials")
+        print(f"[Grid Search] Component trial will continue from: {self.component_trial_counter + 1}")
+        print(f"[Grid Search] Global trial counter is currently: {self.global_trial_counter}")
         
         trial_results_file = os.path.join(component_dir, "trial_results.json")
         if os.path.exists(trial_results_file):
@@ -247,89 +123,102 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
         metrics_file = os.path.join(component_dir, "detailed_metrics.json")
         if os.path.exists(metrics_file):
             with open(metrics_file, 'r') as f:
-                self.component_detailed_metrics[component] = json.load(f)
+                self.component_detailed_metrics[self.current_component] = json.load(f)
         
-        if last_incomplete_trial:
-            last_trial_dir = os.path.join(self.result_dir, f"trial_{self.global_trial_counter:04d}")
-            last_trial_output = os.path.join(last_trial_dir, f"{component}_output.parquet")
-            
-            if not os.path.exists(last_trial_output):
-                print(f"[{component}] Last trial {self.component_trial_counter} (global {self.global_trial_counter}) was incomplete")
-                print(f"[{component}] Will retry this configuration")
-                
-                if self.component_trial_counter > 0:
-                    self.component_trial_counter -= 1
-                
-                if last_incomplete_trial in completed_configs:
-                    completed_configs.remove(last_incomplete_trial)
-            else:
-                print(f"[{component}] Last trial {self.component_trial_counter} was completed")
-                last_incomplete_trial = None
-        
-        print(f"[{component}] Component trial will continue from: {self.component_trial_counter + 1}")
-        print(f"[{component}] Global trial counter is currently: {self.global_trial_counter}")
-        
-        return completed_configs, last_incomplete_trial
+        return completed_configs
     
-    def _get_remaining_combinations(self, valid_combinations: List[Dict],
-                                   completed_configs: List[Dict],
-                                   last_incomplete_trial: Optional[Dict]) -> List[Dict]:
+    def _normalize_config_for_comparison(self, config: Dict, component: str) -> Dict:
+        normalized = config.copy()
+        
+        if component == 'passage_compressor':
+            if 'passage_compressor_method' in config and 'passage_compressor_config' not in config:
+                method = config.get('passage_compressor_method')
+                if method == 'pass_compressor':
+                    normalized = {'passage_compressor_config': 'pass_compressor'}
+                elif method in ['tree_summarize', 'refine']:
+                    gen_type = config.get('compressor_generator_module_type', '')
+                    model = config.get('compressor_model', '')
+                    if gen_type and model:
+                        normalized = {'passage_compressor_config': f"{method}::{gen_type}::{model}"}
+                elif method == 'lexrank':
+                    normalized = {'passage_compressor_config': 'lexrank'}
+                elif method == 'spacy':
+                    spacy_model = config.get('spacy_model', '')
+                    if spacy_model:
+                        normalized = {'passage_compressor_config': f"spacy::{spacy_model}"}
+                    else:
+                        normalized = {'passage_compressor_config': 'spacy'}
+        
+        elif component == 'query_expansion':
+            if 'query_expansion_method' in config and 'query_expansion_config' not in config:
+                method = config.get('query_expansion_method')
+                if method == 'pass_query_expansion':
+                    normalized = {'query_expansion_config': 'pass_query_expansion'}
+                else:
+                    gen_type = config.get('query_expansion_generator_module_type', '')
+                    model = config.get('query_expansion_model', '')
+                    if gen_type and model:
+                        normalized = {'query_expansion_config': f"{method}::{gen_type}::{model}"}
+        
+        elif component == 'prompt_maker_generator':
+            if 'generator_module_type' in config and 'generator_config' not in config:
+                gen_type = config.get('generator_module_type', '')
+                model = config.get('generator_model', '')
+                if gen_type and model:
+                    normalized['generator_config'] = f"{gen_type}::{model}"
+        
+        return normalized
+    
+    def _get_remaining_combinations(self, valid_combinations: List[Dict], 
+                                   completed_configs: List[Dict], 
+                                   component: str) -> List[Dict]:
         remaining_combinations = []
         
-        if last_incomplete_trial and isinstance(last_incomplete_trial, dict):
-            remaining_combinations.append(last_incomplete_trial)
-            print(f"[{self.current_component}] Retrying incomplete configuration first")
+        normalized_completed = set()
+        for config in completed_configs:
+            normalized = self._normalize_config_for_comparison(config, component)
+            normalized_completed.add(json.dumps(normalized, sort_keys=True))
         
         for combo in valid_combinations:
-            combo_str = json.dumps(combo, sort_keys=True)
-            if combo_str not in [json.dumps(c, sort_keys=True) for c in completed_configs]:
-                if not last_incomplete_trial or json.dumps(last_incomplete_trial, sort_keys=True) != combo_str:
-                    remaining_combinations.append(combo)
+            normalized_combo = self._normalize_config_for_comparison(combo, component)
+            combo_str = json.dumps(normalized_combo, sort_keys=True)
+            
+            if combo_str not in normalized_completed:
+                remaining_combinations.append(combo)
         
         return remaining_combinations
     
-    def _run_single_grid_trial(self, component: str, trial_config: Dict,
+    def _print_next_trials(self, remaining_combinations: List[Dict]):
+        if len(remaining_combinations) > 0:
+            for i, trial_config in enumerate(remaining_combinations[:3]):
+                print(f"  Next trial {i+1}: {trial_config}")
+            if len(remaining_combinations) > 3:
+                print(f"  ... and {len(remaining_combinations) - 3} more trials")
+    
+    def _run_single_grid_trial(self, component: str, trial_config: Dict, 
                               fixed_config: Dict, valid_combinations: List,
                               component_dir: str, grid_state_file: str,
-                              completed_configs: List, trial_idx: int,
-                              last_incomplete_trial: Optional[Dict]) -> bool:
+                              completed_configs: List) -> Optional[Dict]:
         self.component_trial_counter += 1
+        self.global_trial_counter += 1
+        self.current_trial = self.global_trial_counter
         
-        if trial_idx == 0 and last_incomplete_trial:
-            print(f"\n[{component}] Retrying incomplete trial {self.component_trial_counter}/{len(valid_combinations)} " +
-                f"(Global trial: {self.global_trial_counter})")
-        else:
-            self.global_trial_counter += 1
-            self.current_trial = self.global_trial_counter
-            print(f"\n[{component}] Running trial {self.component_trial_counter}/{len(valid_combinations)} " +
-                f"(Global trial: {self.global_trial_counter})")
+        print(f"\n[{component}] Running trial {self.component_trial_counter}/{len(valid_combinations)} " +
+              f"(Global trial: {self.global_trial_counter})")
         
         full_config = trial_config.copy()
         full_config.update(fixed_config)
         
+        trial_config, full_config = self._parse_composite_configs(component, trial_config, full_config)
+        
         self._clean_config(full_config)
         
-        trial_id = f"trial_{self.current_trial:04d}"
+        trial_id = f"trial_{self.global_trial_counter:04d}"
         trial_dir = os.path.join(self.result_dir, trial_id)
-        
         os.makedirs(trial_dir, exist_ok=True)
         os.makedirs(os.path.join(trial_dir, "data"), exist_ok=True)
         
-        grid_state_temp = {
-            'completed_configs': completed_configs.copy(),
-            'last_trial_number': self.component_trial_counter,
-            'last_global_trial': self.global_trial_counter,
-            'last_incomplete_trial': trial_config,
-            'total_combinations': len(valid_combinations),
-            'completed_count': len(completed_configs)
-        }
-        with open(grid_state_file, 'w') as f:
-            json.dump(grid_state_temp, f, indent=2)
-        
-        self._save_global_trial_state()
-        
         start_time = time.time()
-        trial_completed = False
         
         try:
             if component == 'passage_compressor' and trial_config.get('passage_compressor_config') == 'pass_compressor':
@@ -343,6 +232,7 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
             self.pipeline_manager.copy_corpus_data(trial_dir)
             
             trial_config_yaml = self.config_generator.generate_trial_config(full_config)
+            
             with open(os.path.join(trial_dir, "config.yaml"), 'w') as f:
                 yaml.dump(trial_config_yaml, f)
             
@@ -371,34 +261,24 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
                 working_df = qa_subset
             
             score = self.pipeline_manager.get_component_score(component, results)
+            
             output_parquet_path = self.pipeline_manager.save_component_output(
                 component, trial_dir, results, working_df
             )
+            
+            if score > self.component_results.get(component, {}).get('best_score', 0.0):
+                self.component_dataframes[component] = output_parquet_path
             
             end_time = time.time()
             latency = end_time - start_time
             
             detailed_metrics = self.pipeline_manager.extract_detailed_metrics(component, results)
-            if component not in self.component_detailed_metrics:
-                self.component_detailed_metrics[component] = []
             self.component_detailed_metrics[component].append(detailed_metrics)
             
-            print(f"\n[Trial {self.current_trial}] Score: {score:.4f} | Time: {latency:.2f}s")
-            trial_completed = True
-            
-        except Exception as e:
-            print(f"\n[ERROR] Trial {self.current_trial} failed: {e}")
-            import traceback
-            traceback.print_exc()
-            score = 0.0
-            latency = float('inf')
-            results = {}
-            output_parquet_path = None
-        
-        if trial_completed or trial_idx == len(valid_combinations) - 1:
             trial_result = self._create_trial_result(
-                {**trial_config, **fixed_config}, score, latency,
-                len(self.qa_data), 1.0, results, component, output_parquet_path
+                full_config, score, latency, 
+                len(qa_subset) if 'qa_subset' in locals() else 0, 1.0,
+                results, component, output_parquet_path
             )
             
             trial_result['component_trial_number'] = self.component_trial_counter
@@ -406,56 +286,122 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
             
             self.component_trials.append(trial_result)
             
-            if score > self.component_results.get(component, {}).get('best_score', 0.0):
-                self.component_dataframes[component] = output_parquet_path
+            if self.wandb_enabled:
+                WandBLogger.log_component_trial(component, self.component_trial_counter, 
+                                              full_config, score, latency)
+                WandBLogger.log_dynamic_component_table(component, self.component_trials, self.wandb_enabled)
+            
+            print(f"[Trial {self.global_trial_counter}] Score: {score:.4f} | Time: {latency:.2f}s")
             
             completed_configs.append(trial_config)
+            self._save_grid_state(grid_state_file, component_dir, completed_configs, valid_combinations)
             
-            grid_state = {
-                'completed_configs': completed_configs,
-                'last_trial_number': self.component_trial_counter,
-                'last_global_trial': self.global_trial_counter,
-                'last_incomplete_trial': None,
-                'total_combinations': len(valid_combinations),
-                'completed_count': len(completed_configs)
-            }
-            with open(grid_state_file, 'w') as f:
-                json.dump(grid_state, f, indent=2)
+            self._save_global_trial_state()
             
-            with open(os.path.join(component_dir, "trial_results.json"), 'w') as f:
-                json.dump(self._convert_numpy_types(self.component_trials), f, indent=2)
+            return trial_result
+                
+        except Exception as e:
+            print(f"\n[ERROR] Trial {self.global_trial_counter} failed: {e}")
+            import traceback
+            traceback.print_exc()
             
-            with open(os.path.join(component_dir, "detailed_metrics.json"), 'w') as f:
-                json.dump(self._convert_numpy_types(self.component_detailed_metrics.get(component, [])), f, indent=2)
+            trial_result = self._create_trial_result(
+                full_config, 0.0, float('inf'), 
+                0, 1.0, {}, component, None
+            )
+            trial_result['status'] = 'FAILED'
+            trial_result['error'] = str(e)
+            self.component_trials.append(trial_result)
             
-            if self.wandb_enabled:
-                WandBLogger.log_component_trial(component, self.component_trial_counter,
-                                            {**trial_config, **fixed_config}, score, latency)
-                WandBLogger.log_dynamic_component_table(component, self.component_trials, self.wandb_enabled)
-        
-        return trial_completed
+            return None
     
-    def _finalize_grid_search(self, component: str, component_dir: str,
-                             fixed_config: Dict, search_space: Dict,
-                             total_combinations: int) -> Dict[str, Any]:
+    def _save_grid_state(self, grid_state_file: str, component_dir: str, 
+                         completed_configs: List, valid_combinations: List):
+        grid_state = {
+            'completed_configs': completed_configs,
+            'last_trial_number': self.component_trial_counter,
+            'last_global_trial': self.global_trial_counter,
+            'total_combinations': len(valid_combinations),
+            'completed_count': len(completed_configs)
+        }
+        with open(grid_state_file, 'w') as f:
+            json.dump(grid_state, f, indent=2)
+        
+        with open(os.path.join(component_dir, "trial_results.json"), 'w') as f:
+            json.dump(self._convert_numpy_types(self.component_trials), f, indent=2)
+        
+        with open(os.path.join(component_dir, "detailed_metrics.json"), 'w') as f:
+            json.dump(self._convert_numpy_types(self.component_detailed_metrics.get(self.current_component, [])), f, indent=2)
+    
+    def _handle_completed_grid_search(self, component: str, fixed_config: Dict, 
+                                 total_combinations: int) -> Dict[str, Any]:
+        print(f"[{component}] All combinations already completed")
+        
         best_trial_data = self._find_best_trial(self.component_trials)
         
+        if best_trial_data:
+            best_config = best_trial_data.get('config', {})
+            best_output_path = best_trial_data.get('output_parquet')
+            
+            if best_output_path and os.path.exists(best_output_path):
+                self.component_dataframes[component] = best_output_path
+                print(f"[{component}] Best configuration found with score {best_trial_data['score']:.4f}")
+                print(f"[{component}] Best output saved at: {best_output_path}")
+                print(f"[{component}] Best config: {best_config}")
+            
+            final_best_config = self._parse_best_config_composite(component, best_config)
+            
+            self.best_configs[component] = final_best_config
+            self.component_results[component] = {
+                'best_score': best_trial_data.get('score', 0.0),
+                'best_config': final_best_config
+            }
+            
+            return {
+                'component': component,
+                'best_config': final_best_config,
+                'best_score': best_trial_data.get('score', 0.0),
+                'best_latency': best_trial_data.get('latency', 0.0),
+                'best_trial': best_trial_data,
+                'all_trials': self.component_trials,
+                'n_trials': len(self.component_trials),
+                'fixed_config': fixed_config,
+                'search_space_size': len(self.search_space_builder.build_component_search_space(component, fixed_config)),
+                'total_combinations': total_combinations,
+                'optimization_method': 'grid',
+                'detailed_metrics': self.component_detailed_metrics.get(component, []),
+                'best_output_path': best_output_path
+            }
+        
+        return {
+            'component': component,
+            'best_config': {},
+            'best_score': 0.0,
+            'n_trials': 0,
+            'optimization_time': 0.0
+        }
+
+    
+    def _finalize_grid_search_results(self, component: str, fixed_config: Dict, 
+                                 total_combinations: int) -> Dict[str, Any]:
+        best_trial_data = Utils.find_best_trial_from_component(self.component_trials, component)
+
         if best_trial_data:
             best_score = best_trial_data['score']
             best_latency = best_trial_data.get('latency', 0.0)
             best_output_path = best_trial_data.get('output_parquet')
-            final_best_config = best_trial_data.get('config', {})
-            
-            if best_output_path and os.path.exists(best_output_path):
-                self.component_dataframes[component] = best_output_path
-                print(f"[{component}] Best configuration found with score {best_score:.4f} and latency {best_latency:.2f}s")
-                print(f"[{component}] Best output saved at: {best_output_path}")
-                print(f"[{component}] Best config: {final_best_config}")
         else:
             best_score = 0.0
             best_latency = 0.0
             best_output_path = None
-            final_best_config = {}
+            
+        if best_output_path and os.path.exists(best_output_path):
+            self.component_dataframes[component] = best_output_path
+            print(f"[{component}] Best configuration found with score {best_score:.4f} and latency {best_latency:.2f}s")
+            print(f"[{component}] Best output saved at: {best_output_path}")
+            
+            if best_trial_data and best_trial_data['config']:
+                print(f"[{component}] Best config: {best_trial_data['config']}")
         
         if self.use_wandb:
             detailed_metrics_dict = {}
@@ -469,6 +415,18 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
                 detailed_metrics_dict
             )
         
+        final_best_config = {}
+        if best_trial_data and 'config' in best_trial_data:
+            final_best_config = best_trial_data['config']
+        
+        final_best_config = self._parse_best_config_composite(component, final_best_config)
+        
+        self.best_configs[component] = final_best_config
+        self.component_results[component] = {
+            'best_score': best_score,
+            'best_config': final_best_config
+        }
+        
         print(f"\n[{component}] Grid search complete:")
         print(f"  - Total trials completed: {len(self.component_trials)}")
         print(f"  - Best score: {best_score:.4f}")
@@ -476,97 +434,15 @@ class ComponentwiseGridSearch(BaseComponentwiseOptimizer):
         return {
             'component': component,
             'best_config': final_best_config,
-            'best_score': best_score,
-            'best_latency': best_latency,
+            'best_score': best_trial_data['score'] if best_trial_data else 0.0,
+            'best_latency': best_trial_data.get('latency', 0.0) if best_trial_data else 0.0,
             'best_trial': best_trial_data,
             'all_trials': self.component_trials,
             'n_trials': len(self.component_trials),
             'fixed_config': fixed_config,
-            'search_space_size': len(search_space),
+            'search_space_size': len(self.search_space_builder.build_component_search_space(component, fixed_config)),
             'total_combinations': total_combinations,
-            'optimization_method': 'grid_search',
+            'optimization_method': 'grid',
             'detailed_metrics': self.component_detailed_metrics.get(component, []),
             'best_output_path': best_output_path
         }
-    
-    def _setup_wandb_for_component(self, component: str, component_idx: int, 
-                                  active_components: List[str]):
-        if self.use_wandb:
-            if hasattr(self, 'wandb') and self.wandb is not None:
-                import wandb
-                if wandb.run is not None:
-                    try:
-                        wandb.finish()
-                    except Exception as e:
-                        print(f"[WARNING] Error finishing previous W&B run: {e}")
-                    time.sleep(2)
-            
-            wandb_run_name = f"{self.study_name}_{component}"
-            try:
-                import wandb
-                wandb.init(
-                    project=self.wandb_project,
-                    entity=self.wandb_entity,
-                    name=wandb_run_name,
-                    config={
-                        "component": component,
-                        "stage": f"{component_idx + 1}/{len(active_components)}",
-                        "optimizer": "grid"
-                    },
-                    reinit=True,
-                    force=True
-                )
-                WandBLogger.reset_step_counter()
-            except Exception as e:
-                print(f"[WARNING] Failed to initialize W&B for {component}: {e}")
-                print(f"[WARNING] Continuing without W&B logging for {component}")
-                self.wandb_enabled = False
-    
-    def _log_wandb_component_summary(self, component: str, component_result: Dict[str, Any]):
-        if self.use_wandb:
-            import wandb
-            if wandb.run is not None:
-                try:
-                    WandBLogger.log_component_summary(
-                        component, 
-                        component_result['best_config'],
-                        component_result['best_score'],
-                        component_result['n_trials'],
-                        component_result.get('optimization_time', 0.0)
-                    )
-                    wandb.finish()
-                except Exception as e:
-                    print(f"[WARNING] Error logging W&B summary for {component}: {e}")
-            
-            if not self.wandb_enabled:
-                self.wandb_enabled = True
-    
-    def _log_wandb_final_summary(self, all_results: Dict[str, Any]):
-        if self.use_wandb:
-            import wandb
-            if wandb.run is not None:
-                try:
-                    wandb.finish()
-                except Exception as e:
-                    print(f"[WARNING] Error finishing component W&B run: {e}")
-                time.sleep(2)
-            
-            try:
-                wandb.init(
-                    project=self.wandb_project,
-                    entity=self.wandb_entity,
-                    name=f"{self.study_name}_summary",
-                    config={
-                        "optimization_mode": "componentwise_grid",
-                        "total_components": len(all_results['component_order']),
-                        "total_time": all_results['optimization_time'],
-                        "optimizer": "grid"
-                    },
-                    reinit=True,
-                    force=True
-                )
-                
-                WandBLogger.log_final_componentwise_summary(all_results)
-                wandb.finish()
-            except Exception as e:
-                print(f"[WARNING] Failed to log final W&B summary: {e}")

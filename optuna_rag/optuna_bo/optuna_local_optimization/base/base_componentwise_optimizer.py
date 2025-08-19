@@ -9,16 +9,16 @@ import wandb
 
 from pipeline.config_manager import ConfigGenerator
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
-from pipeline.search_space_calculator import SearchSpaceCalculator
+from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
 from pipeline.wandb_logger import WandBLogger
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from ..helpers.component_pipeline_manager import ComponentPipelineManager
 from ..helpers.component_search_space_builder import ComponentSearchSpaceBuilder
-from ..helpers.component_grid_search_helper import ComponentGridSearchHelper
 
 
 class BaseComponentwiseOptimizer:
+    """Base class containing shared logic for both Grid Search and Bayesian Optimization"""
     
     COMPONENT_ORDER = [
         'query_expansion',
@@ -53,7 +53,7 @@ class BaseComponentwiseOptimizer:
         optimizer: str = "tpe",
         use_multi_objective: bool = False,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o",
+        llm_evaluator_config: Optional[Dict[str, Any]] = None,
         resume_study: bool = False,
     ):
         self.config_template = config_template
@@ -79,9 +79,9 @@ class BaseComponentwiseOptimizer:
         self.wandb_entity = wandb_entity
         self.optimizer = optimizer.lower()
         self.use_multi_objective = use_multi_objective
-        
+
         self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
-        self.llm_evaluator_model = llm_evaluator_model
+        self.llm_evaluator_config = llm_evaluator_config or {}
         
         self.component_detailed_metrics = {}
         
@@ -100,37 +100,29 @@ class BaseComponentwiseOptimizer:
         self.global_trial_counter = 0
         self.global_trial_state_file = os.path.join(self.result_dir, "global_trial_state.json")
         
-        self.component_results = {}
-        self.best_configs = {}
-        self.component_dataframes = {}
-        self.current_trial = 0
-        self.trial_results = []
-        
         if self.resume_study:
             self._load_previous_state()
             self._load_global_trial_state()
-        else:
-            self.current_trial = self.global_trial_counter
         
         self.config_generator = ConfigGenerator(self.config_template)
-        self.search_space_calculator = SearchSpaceCalculator(self.config_generator)
-        
-        search_type = 'grid' if self.optimizer == 'grid' else 'bo'
+        search_type = 'grid' if self.optimizer.lower() in ['grid', 'grid_search'] else 'bo'
+        self.combination_calculator = CombinationCalculator(
+            self.config_generator, 
+            search_type=search_type
+        )
         self.config_extractor = OptunaConfigExtractor(self.config_generator, search_type=search_type)
-        
         self.search_space_builder = ComponentSearchSpaceBuilder(self.config_generator, self.config_extractor)
         self.pipeline_manager = ComponentPipelineManager(self.config_generator, self.project_dir, self.corpus_data, self.qa_data)
-        
-        self.grid_search_helper = ComponentGridSearchHelper()
-        
+
         self._setup_runner()
         
-        Utils.ensure_centralized_data(self.project_dir, self.corpus_data, self.qa_data)
+        self.component_results = {}
+        self.best_configs = {}
+        self.component_dataframes = {}
+        self.current_trial = self.global_trial_counter
+        self.trial_results = []
         
-        self.current_component = None
-        self.current_fixed_config = {}
-        self.component_trial_counter = 0
-        self.component_trials = []
+        Utils.ensure_centralized_data(self.project_dir, self.corpus_data, self.qa_data)
     
     def _load_global_trial_state(self):
         if os.path.exists(self.global_trial_state_file):
@@ -142,7 +134,7 @@ class BaseComponentwiseOptimizer:
         else:
             self.global_trial_counter = 0
             self.current_trial = 0
-
+    
     def _save_global_trial_state(self):
         state = {
             'global_trial_counter': self.global_trial_counter,
@@ -150,45 +142,6 @@ class BaseComponentwiseOptimizer:
         }
         with open(self.global_trial_state_file, 'w') as f:
             json.dump(state, f, indent=2)
-    
-    def _load_previous_state(self):
-        summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
-        
-        if os.path.exists(summary_file):
-            with open(summary_file, 'r') as f:
-                previous_results = json.load(f)
-            
-            self.best_configs = previous_results.get('best_configs', {})
-            self.component_results = previous_results.get('component_results', {})
-            
-            for component, result in previous_results.get('component_results', {}).items():
-                if 'best_output_path' in result and os.path.exists(result['best_output_path']):
-                    self.component_dataframes[component] = result['best_output_path']
-            
-            print(f"\n[RESUME] Loaded previous state from {summary_file}")
-            print(f"[RESUME] Previously completed components: {list(self.best_configs.keys())}")
-        else:
-            print(f"\n[RESUME] No previous state found. Starting fresh optimization.")
-            self.resume_study = False
-    
-    def _save_intermediate_state(self):
-        summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
-        
-        state = {
-            'study_name': self.study_name,
-            'component_results': self.component_results,
-            'best_configs': self.best_configs,
-            'component_order': list(self.component_results.keys()),
-            'retrieval_weight': self.retrieval_weight,
-            'generation_weight': self.generation_weight
-        }
-        
-        state_serializable = self._convert_numpy_types(state)
-        
-        with open(summary_file, 'w') as f:
-            json.dump(state_serializable, f, indent=2)
-        
-        print(f"[CHECKPOINT] Saved intermediate state to {summary_file}")
     
     def _setup_runner(self):
         self.retrieval_metrics = self.config_generator.extract_retrieval_metrics_from_config()
@@ -198,6 +151,14 @@ class BaseComponentwiseOptimizer:
         self.generation_metrics = self.config_generator.extract_generation_metrics_from_config()
         self.prompt_maker_metrics = self.config_generator.extract_generation_metrics_from_config('prompt_maker')
         self.query_expansion_metrics = self.config_generator.extract_query_expansion_metrics_from_config()
+        
+        early_stopping_thresholds = {
+            'retrieval': -1.0,
+            'query_expansion': -1.0,
+            'reranker': -1.0,
+            'filter': -1.0,
+            'compressor': -1.0
+        }
         
         self.pipeline_runner = RAGPipelineRunner(
             config_generator=self.config_generator,
@@ -212,11 +173,12 @@ class BaseComponentwiseOptimizer:
             generation_weight=self.generation_weight,
             use_ragas=False,
             ragas_config=None,
-            use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-            llm_evaluator_model=self.llm_evaluator_model
+            use_llm_evaluator=self.use_llm_compressor_evaluator,
+            llm_evaluator_config=self.llm_evaluator_config,
+            early_stopping_thresholds=early_stopping_thresholds
         )
     
-    def _validate_all_components(self) -> Tuple[bool, List[str], Dict[str, int]]:
+    def _validate_all_components(self) -> Tuple[bool, List[str], Dict[str, int], str]:
         active_components = []
         has_active_query_expansion = False
         
@@ -240,120 +202,70 @@ class BaseComponentwiseOptimizer:
                 active_components.append(comp)
         
         component_combinations = {}
+        combination_note = ""
         
         for component in active_components:
             fixed_config = self._get_fixed_config(component, active_components)
             search_space = self.search_space_builder.build_component_search_space(component, fixed_config)
             
-            if component == 'prompt_maker_generator':
-                print(f"\n[DEBUG] {component} search space for {self.optimizer}:")
-                for key, value in search_space.items():
-                    print(f"  {key}: {value} (type: {type(value)})")
-            
             if search_space:
-                combinations = self.grid_search_helper.calculate_grid_search_combinations(
-                    component, search_space, fixed_config
+                combinations, note = self.combination_calculator.calculate_component_combinations(
+                    component, 
+                    search_space, 
+                    fixed_config, 
+                    self.best_configs
                 )
+                combination_note = note
             else:
                 combinations = 0
             
             component_combinations[component] = combinations
         
-        n_trials = self.n_trials_per_component if self.n_trials_per_component else 10
+        return True, [], component_combinations, combination_note
+    
+    def _load_previous_state(self):
+        summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
         
-        if self.optimizer == 'grid':
-            print(f"\n{'='*70}")
-            for comp, combos in component_combinations.items():
-                print(f"  - {comp}: {combos} combinations")
-            print(f"{'='*70}\n")
+        if os.path.exists(summary_file):
+            with open(summary_file, 'r') as f:
+                previous_results = json.load(f)
+
+            self.best_configs = previous_results.get('best_configs', {})
+            self.component_results = previous_results.get('component_results', {})
+
+            for component, result in previous_results.get('component_results', {}).items():
+                if 'best_output_path' in result and os.path.exists(result['best_output_path']):
+                    self.component_dataframes[component] = result['best_output_path']
+            
+            print(f"\n[RESUME] Loaded previous state from {summary_file}")
+            print(f"[RESUME] Previously completed components: {list(self.best_configs.keys())}")
         else:
-            print(f"\n{'='*70}")
-            print(f"COMPONENT VALIDATION PASSED")
-            print(f"All components have sufficient search space for optimization:")
-            
-            for component in active_components:
-                combos = component_combinations[component]
-                
-                if combos == 0:
-                    print(f"  - {component}: No search space (will be skipped)")
-                    continue
-                    
-                print(f"  - {component}: {combos} combinations")
-                
-                if combos < n_trials and combos > 0:
-                    if component in ['query_expansion', 'retrieval', 'passage_reranker']:
-                        print(f"    ⚠️  WARNING: Search space ({combos}) < n_trials ({n_trials})")
-                        print(f"       May encounter duplicate sampling during optimization")
-                    elif component == 'passage_filter':
-                        print(f"    ℹ️  INFO: For filters, the actual search space is continuous")
-                        print(f"       between threshold/percentile boundaries")
-                    else:
-                        print(f"    ℹ️  INFO: Search space ({combos}) < n_trials ({n_trials})")
-                        print(f"       Consider adding more parameter values or reducing n_trials")
-            
-            print(f"{'='*70}\n")
-        
-        return True, [], component_combinations
+            print(f"\n[RESUME] No previous state found. Starting fresh optimization.")
+            self.resume_study = False
     
     def _get_fixed_config(self, component: str, active_components: List[str]) -> Dict[str, Any]:
         fixed_config = {}
-                
-        original_retriever_top_k = 10
-        
-        if 'query_expansion' in self.best_configs:
-            qe_config = self.best_configs['query_expansion']
-            print(f"[DEBUG] Query expansion best config: {qe_config}")
-            
-            if 'retriever_top_k' in qe_config:
-                original_retriever_top_k = qe_config['retriever_top_k']
-                
-            if 'retrieval_method' in qe_config:
-                fixed_config['retrieval_method'] = qe_config['retrieval_method']
-            
-            if qe_config.get('retrieval_method') == 'bm25' and 'bm25_tokenizer' in qe_config:
-                fixed_config['bm25_tokenizer'] = qe_config['bm25_tokenizer']
-            elif qe_config.get('retrieval_method') == 'vectordb' and 'vectordb_name' in qe_config:
-                fixed_config['vectordb_name'] = qe_config['vectordb_name']
-        
-        if 'retrieval' in self.best_configs:
-            retrieval_config = self.best_configs['retrieval']
-            print(f"[DEBUG] Retrieval best config: {retrieval_config}")
-            
-            if 'retriever_top_k' in retrieval_config:
-                original_retriever_top_k = retrieval_config['retriever_top_k']
-                
-            if 'retrieval_method' in retrieval_config:
-                fixed_config['retrieval_method'] = retrieval_config['retrieval_method']
-            
-            if retrieval_config.get('retrieval_method') == 'bm25' and 'bm25_tokenizer' in retrieval_config:
-                fixed_config['bm25_tokenizer'] = retrieval_config['bm25_tokenizer']
-            elif retrieval_config.get('retrieval_method') == 'vectordb' and 'vectordb_name' in retrieval_config:
-                fixed_config['vectordb_name'] = retrieval_config['vectordb_name']
-        
-        if 'retrieval_method' not in fixed_config and component not in ['query_expansion', 'retrieval']:
-            retrieval_node = self.config_generator.extract_node_config("retrieval")
-            if retrieval_node:
-                for module in retrieval_node.get("modules", []):
-                    method = module.get("module_type")
-                    if method:
-                        fixed_config['retrieval_method'] = method                        
-                        if method == 'bm25':
-                            tokenizer = module.get('tokenizer', module.get('bm25_tokenizer'))
-                            if tokenizer:
-                                if isinstance(tokenizer, list):
-                                    fixed_config['bm25_tokenizer'] = tokenizer[0] if tokenizer else None
-                                else:
-                                    fixed_config['bm25_tokenizer'] = tokenizer
-                        elif method == 'vectordb':
-                            vectordb = module.get('vectordb_name', module.get('name'))
-                            if vectordb:
-                                if isinstance(vectordb, list):
-                                    fixed_config['vectordb_name'] = vectordb[0] if vectordb else None
-                                else:
-                                    fixed_config['vectordb_name'] = vectordb
-                        break
         
         if component not in ['query_expansion', 'retrieval']:
+            original_retriever_top_k = 10
+            
+            if 'query_expansion' in self.best_configs:
+                qe_config = self.best_configs['query_expansion']
+                if 'retriever_top_k' in qe_config:
+                    original_retriever_top_k = qe_config['retriever_top_k']
+            
+            if 'retrieval' in self.best_configs:
+                retrieval_config = self.best_configs['retrieval']
+                if 'retriever_top_k' in retrieval_config:
+                    original_retriever_top_k = retrieval_config['retriever_top_k']
+
+                if 'retrieval_method' in retrieval_config:
+                    fixed_config['retrieval_method'] = retrieval_config['retrieval_method']
+                if retrieval_config.get('retrieval_method') == 'bm25' and 'bm25_tokenizer' in retrieval_config:
+                    fixed_config['bm25_tokenizer'] = retrieval_config['bm25_tokenizer']
+                elif retrieval_config.get('retrieval_method') == 'vectordb' and 'vectordb_name' in retrieval_config:
+                    fixed_config['vectordb_name'] = retrieval_config['vectordb_name']
+
             if component in ['passage_compressor', 'prompt_maker_generator']:
                 if 'passage_filter' in self.best_configs:
                     filter_config = self.best_configs['passage_filter']
@@ -398,19 +310,16 @@ class BaseComponentwiseOptimizer:
                         fixed_config['bm25_tokenizer'] = best_config['bm25_tokenizer']
                     if 'vectordb_name' in best_config:
                         fixed_config['vectordb_name'] = best_config['vectordb_name']
-                    if 'retriever_top_k' in best_config:
-                        fixed_config['retriever_top_k'] = best_config['retriever_top_k']
                     
                     if best_config.get('query_expansion_method') != 'pass_query_expansion':
-                        for key in ['query_expansion_model', 'query_expansion_temperature', 'query_expansion_max_token']:
+                        for key in ['query_expansion_model', 'query_expansion_temperature', 'query_expansion_max_token',
+                                    'query_expansion_api_url', 'query_expansion_llm']:
                             if key in best_config:
                                 fixed_config[key] = best_config[key]
                 
                 elif prev_comp == 'retrieval':
                     if 'retrieval_method' in best_config:
                         fixed_config['retrieval_method'] = best_config['retrieval_method']
-                    if 'retriever_top_k' in best_config:
-                        fixed_config['retriever_top_k'] = best_config['retriever_top_k']
                     if best_config.get('retrieval_method') == 'bm25' and 'bm25_tokenizer' in best_config:
                         fixed_config['bm25_tokenizer'] = best_config['bm25_tokenizer']
                     elif best_config.get('retrieval_method') == 'vectordb' and 'vectordb_name' in best_config:
@@ -423,8 +332,15 @@ class BaseComponentwiseOptimizer:
                         fixed_config['reranker_top_k'] = best_config['reranker_top_k']
                     if 'reranker_model' in best_config:
                         fixed_config['reranker_model'] = best_config['reranker_model']
-                    if 'reranker_model_name' in best_config:
-                        fixed_config['reranker_model_name'] = best_config['reranker_model_name']
+                    if 'reranker_api_url' in best_config:
+                        fixed_config['reranker_api_url'] = best_config['reranker_api_url']
+                    
+                    if best_config.get('passage_reranker_method') == 'sap_api':
+                        reranker_config = self.config_generator.extract_node_config("passage_reranker")
+                        for module in reranker_config.get("modules", []):
+                            if module.get("module_type") == "sap_api":
+                                fixed_config['reranker_api_url'] = module.get('api_url')
+                                break
                 
                 elif prev_comp == 'passage_filter':
                     if 'passage_filter_method' in best_config:
@@ -450,6 +366,11 @@ class BaseComponentwiseOptimizer:
                         fixed_config['compressor_temperature'] = best_config['compressor_temperature']
                     if 'compressor_max_tokens' in best_config:
                         fixed_config['compressor_max_tokens'] = best_config['compressor_max_tokens']
+                    
+                    for key in ['lexrank_compression_ratio', 'lexrank_threshold', 'lexrank_damping', 'lexrank_max_iterations',
+                            'spacy_compression_ratio', 'spacy_model']:
+                        if key in best_config:
+                            fixed_config[key] = best_config[key]
         
         return fixed_config
     
@@ -459,49 +380,8 @@ class BaseComponentwiseOptimizer:
         
         return min(20, max(10, len(search_space) * 3))
     
-    def _calculate_total_combinations(self, component: str, search_space: Dict[str, Any]) -> int:
-        if self.optimizer == 'grid':
-            return self.grid_search_helper.calculate_grid_search_combinations(
-                component, search_space, self.current_fixed_config
-            )
-        else:
-            fixed_config = self._get_fixed_config(component, self.COMPONENT_ORDER)
-            combinations, _ = self.search_space_calculator.calculate_component_combinations(
-                component, 
-                search_space, 
-                fixed_config, 
-                self.best_configs
-            )
-            return combinations
-    
-    def _find_best_trial(self, trials: List[Dict]) -> Optional[Dict]:
-        if not trials:
-            return None
-
-        score_groups = {}
-        for trial in trials:
-            if trial.get('status') != 'FAILED':
-                score = trial['score']
-                if score not in score_groups:
-                    score_groups[score] = []
-                score_groups[score].append(trial)
-        
-        if not score_groups:
-            return None
-
-        max_score = max(score_groups.keys())
-        trials_with_max_score = score_groups[max_score]
-
-        if len(trials_with_max_score) > 1:
-            print(f"Found {len(trials_with_max_score)} trials with score {max_score:.4f}, selecting by latency")
-            best_trial = min(trials_with_max_score, key=lambda t: t.get('latency', float('inf')))
-            print(f"Selected trial {best_trial['trial_number']} with latency {best_trial['latency']:.2f}s")
-            return best_trial
-        else:
-            return trials_with_max_score[0]
-    
     def _create_trial_result(self, config_dict, score, latency, budget, budget_percentage, 
-                        results, component, output_parquet_path):
+            results, component, output_parquet_path):
         trial_number_in_component = int(self.component_trial_counter)
         
         component_config = {}
@@ -511,36 +391,38 @@ class BaseComponentwiseOptimizer:
                 'passage_compressor_config', 'passage_compressor_method',
                 'compressor_generator_module_type', 'compressor_model', 
                 'compressor_llm', 'compressor_api_url', 'compressor_batch',
-                'compressor_temperature', 'compressor_max_tokens'
+                'compressor_temperature', 'compressor_max_tokens',
+                'lexrank_compression_ratio', 'lexrank_threshold', 'lexrank_damping', 'lexrank_max_iterations',
+                'spacy_compression_ratio', 'spacy_model'
             ]
             for param in compressor_params:
                 if param in config_dict and param not in self.current_fixed_config:
                     component_config[param] = config_dict[param]
             
-            if not component_config:
-                if config_dict.get('passage_compressor_method') == 'pass_compressor':
-                    component_config['passage_compressor_method'] = 'pass_compressor'
-                elif config_dict.get('passage_compressor_config') == 'pass_compressor':
-                    component_config['passage_compressor_method'] = 'pass_compressor'
+            if not component_config and 'passage_compressor_method' in config_dict:
+                component_config['passage_compressor_method'] = config_dict['passage_compressor_method']
         
         elif component == 'query_expansion':
             qe_params = [
                 'query_expansion_config', 'query_expansion_method',
                 'query_expansion_model', 'query_expansion_temperature',
                 'query_expansion_max_token', 'retriever_top_k',
-                'retrieval_method', 'bm25_tokenizer', 'vectordb_name'
+                'retrieval_method', 'bm25_tokenizer', 'vectordb_name',
+                'query_expansion_api_url', 'query_expansion_llm'
             ]
             for param in qe_params:
                 if param in config_dict and param not in self.current_fixed_config:
                     component_config[param] = config_dict[param]
+                    
         elif component == 'passage_reranker':
             reranker_params = [
                 'passage_reranker_method', 'reranker_top_k',
-                'reranker_model', 'reranker_model_name'
+                'reranker_model', 'reranker_model_name', 'reranker_api_url'
             ]
             for param in reranker_params:
                 if param in config_dict and param not in self.current_fixed_config:
                     component_config[param] = config_dict[param]
+                    
         elif component == 'passage_filter':
             filter_params = [
                 'passage_filter_method', 'threshold', 'percentile'
@@ -548,6 +430,7 @@ class BaseComponentwiseOptimizer:
             for param in filter_params:
                 if param in config_dict and param not in self.current_fixed_config:
                     component_config[param] = config_dict[param]
+                    
         elif component == 'prompt_maker_generator':
             generator_params = [
                 'prompt_maker_method', 'prompt_template_idx',
@@ -595,67 +478,15 @@ class BaseComponentwiseOptimizer:
         return trial_result
     
     def _convert_numpy_types(self, obj):
-        if isinstance(obj, pd.DataFrame):
-            return None
-        elif isinstance(obj, (np.integer, np.int64, np.int32)):
-            return int(obj)
-        elif isinstance(obj, np.floating): 
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            result = {}
-            for k, v in obj.items():
-                converted = self._convert_numpy_types(v)
-                if converted is not None: 
-                    result[k] = converted
-            return result
-        elif isinstance(obj, list):
-            result = []
-            for item in obj:
-                converted = self._convert_numpy_types(item)
-                if converted is not None:
-                    result.append(converted)
-            return result
-        else:
-            return obj
+        return Utils.convert_numpy_types(obj)
     
-    def _clean_config(self, config: Dict[str, Any]):
-        composite_params = [
-            'query_expansion_config',
-            'generator_config'
-        ]
-        
-        for param in composite_params:
-            config.pop(param, None)
-        
-        config.pop('compressor_bearer_token', None)
-        config.pop('generator_bearer_token', None)
-        config.pop('query_expansion_bearer_token', None)
-        
-        if config.get('passage_compressor_method') in ['refine', 'tree_summarize']:
-            config.pop('compressor_temperature', None)
-            config.pop('compressor_max_tokens', None)
+    def _find_best_trial(self, trials) -> Optional[Dict]:
+        return Utils.find_best_trial_from_component(trials, self.current_component)
     
     def _save_final_results(self, results: Dict[str, Any]):
-        summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
-        
-        results_serializable = self._convert_numpy_types(results)
-        
-        with open(summary_file, 'w') as f:
-            json.dump(results_serializable, f, indent=2)
-        
-        if not results.get('validation_failed', False):
-            final_config = {}
-            for component in results['component_order']:
-                if component in results['best_configs'] and results['best_configs'][component]:
-                    final_config.update(results['best_configs'][component])
-            
-            if final_config:
-                final_config_file = os.path.join(self.result_dir, "final_best_config.yaml")
-                final_config_serializable = self._convert_numpy_types(final_config)
-                with open(final_config_file, 'w') as f:
-                    yaml.dump(self.config_generator.generate_trial_config(final_config_serializable), f)
+        Utils.save_component_optimization_results(
+            self.result_dir, results, self.config_generator
+        )
     
     def _print_final_summary(self, results: Dict[str, Any]):
         print(f"\nTotal optimization time: {Utils.format_time_duration(results['optimization_time'])}")
@@ -676,18 +507,320 @@ class BaseComponentwiseOptimizer:
                     if component in results.get('best_configs', {}):
                         print(f"  Config: {results['best_configs'][component]}")
     
-    def _get_component_combinations(self, component: str) -> int:
-        fixed_config = self._get_fixed_config(component, self.COMPONENT_ORDER)
-        search_space = self.search_space_builder.build_component_search_space(component, fixed_config)
+    def _clean_config(self, config: Dict[str, Any]):
+        composite_params = [
+            'query_expansion_config',
+            'passage_compressor_config',
+            'generator_config'
+        ]
         
-        if not search_space:
-            return 0
+        for param in composite_params:
+            config.pop(param, None)
         
-        combinations, _ = self.search_space_calculator.calculate_component_combinations(
-            component, 
-            search_space, 
-            fixed_config, 
-            self.best_configs
-        )
+        config.pop('compressor_bearer_token', None)
+        config.pop('generator_bearer_token', None)
+        config.pop('query_expansion_bearer_token', None)
         
-        return combinations
+        if config.get('passage_compressor_method') in ['refine', 'tree_summarize']:
+            config.pop('compressor_temperature', None)
+            config.pop('compressor_max_tokens', None)
+
+        for key in sorted(config.keys()):
+            if 'api_url' in key:
+                print(f"  {key}: {config[key]}")
+    
+    def _parse_composite_configs(self, component: str, trial_config: Dict[str, Any], 
+                            full_config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        trial_config = trial_config.copy()
+        full_config = full_config.copy()
+        
+        if component == 'query_expansion' and 'query_expansion_config' in trial_config:
+            qe_config_str = trial_config['query_expansion_config']
+            parts = qe_config_str.split('::', 2)
+            
+            if len(parts) >= 3:
+                method, gen_type, model = parts
+                trial_config['query_expansion_method'] = method
+                trial_config['query_expansion_generator_module_type'] = gen_type
+                trial_config['query_expansion_model'] = model
+                full_config['query_expansion_method'] = method
+                full_config['query_expansion_generator_module_type'] = gen_type
+                full_config['query_expansion_model'] = model
+                
+                unified_params = self.config_generator.extract_unified_parameters('query_expansion')
+                for gen_config in unified_params.get('generator_configs', []):
+                    if (gen_config['method'] == method and 
+                        gen_config['generator_module_type'] == gen_type and 
+                        model in gen_config['models']):
+                        if gen_type == 'sap_api':
+                            trial_config['query_expansion_api_url'] = gen_config.get('api_url')
+                            trial_config['query_expansion_llm'] = gen_config.get('llm', 'mistralai')
+                            full_config['query_expansion_api_url'] = gen_config.get('api_url')
+                            full_config['query_expansion_llm'] = gen_config.get('llm', 'mistralai')
+                        else:
+                            trial_config['query_expansion_llm'] = gen_config.get('llm', 'openai')
+                            full_config['query_expansion_llm'] = gen_config.get('llm', 'openai')
+                        break
+            elif qe_config_str == 'pass_query_expansion':
+                trial_config['query_expansion_method'] = 'pass_query_expansion'
+                full_config['query_expansion_method'] = 'pass_query_expansion'
+            
+            trial_config.pop('query_expansion_config', None)
+            full_config.pop('query_expansion_config', None)
+        
+        if component == 'retrieval' and 'retrieval_config' in trial_config:
+            parsed_config = self.pipeline_runner._parse_retrieval_config(trial_config['retrieval_config'])
+            trial_config.update(parsed_config)
+            full_config.update(parsed_config)
+            trial_config.pop('retrieval_config', None)
+            full_config.pop('retrieval_config', None)
+        
+        if component == 'passage_reranker':
+            if 'sap_api_models' in trial_config:
+                trial_config['reranker_model'] = trial_config['sap_api_models']
+                full_config['reranker_model'] = trial_config['sap_api_models']
+                trial_config.pop('sap_api_models', None)
+                full_config.pop('sap_api_models', None)
+            
+            if trial_config.get('passage_reranker_method') == 'sap_api' or full_config.get('passage_reranker_method') == 'sap_api':
+                reranker_config = self.config_generator.extract_node_config("passage_reranker")
+                api_url_found = False
+                
+                for module in reranker_config.get("modules", []):
+                    if module.get("module_type") == "sap_api":
+                        api_url = module.get('api-url') or module.get('api_url')
+                        if api_url:
+                            trial_config['reranker_api_url'] = api_url
+                            full_config['reranker_api_url'] = api_url
+                            api_url_found = True
+                            print(f"[DEBUG] Set reranker_api_url from config: {api_url}")
+                        break
+                
+                if not api_url_found:
+                    unified_params = self.config_generator.extract_unified_parameters('passage_reranker')
+                    api_endpoints = unified_params.get('api_endpoints', {})
+                    if 'sap_api' in api_endpoints:
+                        api_url = api_endpoints['sap_api']
+                        trial_config['reranker_api_url'] = api_url
+                        full_config['reranker_api_url'] = api_url
+                        print(f"[DEBUG] Set reranker_api_url from unified params: {api_url}")
+        
+        if component == 'passage_compressor':
+            if 'lexrank_compression_ratio' in trial_config or 'lexrank_threshold' in trial_config:
+                trial_config['passage_compressor_method'] = 'lexrank'
+                full_config['passage_compressor_method'] = 'lexrank'
+                print("[DEBUG] Set passage_compressor_method to 'lexrank' based on lexrank parameters")
+            
+            elif 'spacy_compression_ratio' in trial_config or 'spacy_model' in trial_config:
+                trial_config['passage_compressor_method'] = 'spacy'
+                full_config['passage_compressor_method'] = 'spacy'
+                print("[DEBUG] Set passage_compressor_method to 'spacy' based on spacy parameters")
+            
+            elif 'passage_compressor_config' in trial_config:
+                pc_config_str = trial_config['passage_compressor_config']
+                
+                if pc_config_str == 'pass_compressor':
+                    trial_config['passage_compressor_method'] = 'pass_compressor'
+                    full_config['passage_compressor_method'] = 'pass_compressor'
+                
+                elif pc_config_str == 'lexrank':
+                    trial_config['passage_compressor_method'] = 'lexrank'
+                    full_config['passage_compressor_method'] = 'lexrank'
+                
+                elif pc_config_str.startswith('spacy::'):
+                    parts = pc_config_str.split('::', 1)
+                    trial_config['passage_compressor_method'] = 'spacy'
+                    full_config['passage_compressor_method'] = 'spacy'
+                    if len(parts) > 1:
+                        trial_config['spacy_model'] = parts[1]
+                        full_config['spacy_model'] = parts[1]
+                
+                elif pc_config_str in ['sentence_rank', 'keyword_extraction', 'query_focused']:
+                    trial_config['passage_compressor_method'] = pc_config_str
+                    full_config['passage_compressor_method'] = pc_config_str
+                
+                else:
+                    parts = pc_config_str.split('::', 3)
+                    if len(parts) >= 2:
+                        method = parts[0]
+                        trial_config['passage_compressor_method'] = method
+                        full_config['passage_compressor_method'] = method
+                        
+                        if method in ['tree_summarize', 'refine'] and len(parts) >= 3:
+                            gen_type = parts[1]
+                            model = parts[2]
+                            trial_config['compressor_generator_module_type'] = gen_type
+                            trial_config['compressor_model'] = model
+                            full_config['compressor_generator_module_type'] = gen_type
+                            full_config['compressor_model'] = model
+                            
+                            compressor_config = self.config_generator.extract_node_config("passage_compressor")
+                            for module in compressor_config.get("modules", []):
+                                if module.get("module_type") == method:
+                                    if 'generator' in module:
+                                        for gen_module in module.get("generator", {}).get("modules", []):
+                                            if gen_module.get("module_type") == gen_type:
+                                                models = gen_module.get('model', gen_module.get('llm', []))
+                                                if not isinstance(models, list):
+                                                    models = [models]
+                                                if model in models:
+                                                    if gen_type == 'sap_api':
+                                                        api_url = gen_module.get('api_url') or gen_module.get('api-url')
+                                                        if api_url:
+                                                            trial_config['compressor_api_url'] = api_url
+                                                            full_config['compressor_api_url'] = api_url
+                                                            print(f"[DEBUG] Set compressor_api_url from config: {api_url}")
+                                                        trial_config['compressor_llm'] = gen_module.get('llm', 'mistralai')
+                                                        full_config['compressor_llm'] = gen_module.get('llm', 'mistralai')
+                                                    else:
+                                                        trial_config['compressor_llm'] = gen_module.get('llm', 'openai')
+                                                        full_config['compressor_llm'] = gen_module.get('llm', 'openai')
+                                                    break
+                                    else:
+                                        if gen_type == 'sap_api':
+                                            api_url = module.get('api_url') or module.get('api-url')
+                                            if api_url:
+                                                trial_config['compressor_api_url'] = api_url
+                                                full_config['compressor_api_url'] = api_url
+                                            trial_config['compressor_llm'] = module.get('llm', 'mistralai')
+                                            full_config['compressor_llm'] = module.get('llm', 'mistralai')
+                                        else:
+                                            trial_config['compressor_llm'] = module.get('llm', 'openai')
+                                            full_config['compressor_llm'] = module.get('llm', 'openai')
+                                        
+                                        if 'model' in module:
+                                            trial_config['compressor_model'] = module['model']
+                                            full_config['compressor_model'] = module['model']
+                                    break
+                
+                trial_config.pop('passage_compressor_config', None)
+                full_config.pop('passage_compressor_config', None)
+        
+        if component == 'prompt_maker_generator' and 'generator_config' in trial_config:
+            gen_config_str = trial_config['generator_config']
+            parts = gen_config_str.split('::', 2)
+            if len(parts) >= 2:
+                gen_type = parts[0]
+                model = parts[1]
+                trial_config['generator_module_type'] = gen_type
+                trial_config['generator_model'] = model
+                full_config['generator_module_type'] = gen_type
+                full_config['generator_model'] = model
+                
+                gen_node_config = self.config_generator.extract_node_config("generator")
+                for module in gen_node_config.get("modules", []):
+                    if module.get("module_type") == gen_type:
+                        models = module.get('model', module.get('llm', []))
+                        if not isinstance(models, list):
+                            models = [models]
+                        if model in models:
+                            if gen_type == 'sap_api':
+                                api_url = module.get('api_url') or module.get('api-url')
+                                if api_url:
+                                    trial_config['generator_api_url'] = api_url
+                                    full_config['generator_api_url'] = api_url
+                                    print(f"[DEBUG] Set generator_api_url from config: {api_url}")
+                                trial_config['generator_llm'] = module.get('llm', 'mistralai')
+                                full_config['generator_llm'] = module.get('llm', 'mistralai')
+                            else:
+                                trial_config['generator_llm'] = module.get('llm', 'openai')
+                                full_config['generator_llm'] = module.get('llm', 'openai')
+                            break
+            
+            trial_config.pop('generator_config', None)
+            full_config.pop('generator_config', None)
+        
+        return trial_config, full_config
+
+    def _parse_best_config_composite(self, component: str, best_config: Dict[str, Any]) -> Dict[str, Any]:
+        final_config = best_config.copy()
+        
+        if component == 'query_expansion' and 'query_expansion_config' in final_config:
+            qe_config_str = final_config['query_expansion_config']
+            if qe_config_str != 'pass_query_expansion':
+                parts = qe_config_str.split('::', 2)
+                if len(parts) >= 3:
+                    method, gen_type, model = parts
+                    final_config['query_expansion_method'] = method
+                    final_config['query_expansion_generator_module_type'] = gen_type
+                    final_config['query_expansion_model'] = model
+                    
+                    unified_params = self.config_generator.extract_unified_parameters('query_expansion')
+                    for gen_config in unified_params.get('generator_configs', []):
+                        if (gen_config['method'] == method and 
+                            gen_config['generator_module_type'] == gen_type and 
+                            model in gen_config['models']):
+                            if gen_type == 'sap_api':
+                                final_config['query_expansion_api_url'] = gen_config.get('api_url')
+                                final_config['query_expansion_llm'] = gen_config.get('llm', 'mistralai')
+                            else:
+                                final_config['query_expansion_llm'] = gen_config.get('llm', 'openai')
+                            break
+                    
+                    final_config.pop('query_expansion_config', None)
+            else:
+                final_config['query_expansion_method'] = 'pass_query_expansion'
+                final_config.pop('query_expansion_config', None)
+        
+        if component == 'retrieval' and 'retrieval_config' in final_config:
+            parsed_config = self.pipeline_runner._parse_retrieval_config(final_config['retrieval_config'])
+            final_config.update(parsed_config)
+            final_config.pop('retrieval_config', None)
+        
+        if component == 'passage_compressor' and 'passage_compressor_config' in final_config:
+            pc_config_str = final_config['passage_compressor_config']
+            if pc_config_str != 'pass_compressor':
+                parts = pc_config_str.split('::', 3)
+                if len(parts) >= 2:
+                    method = parts[0]
+                    final_config['passage_compressor_method'] = method
+                    
+                    if method in ['tree_summarize', 'refine'] and len(parts) >= 3:
+                        gen_type = parts[1]
+                        model = parts[2]
+                        final_config['compressor_generator_module_type'] = gen_type
+                        final_config['compressor_model'] = model
+                        
+                        unified_params = self.config_generator.extract_unified_parameters('passage_compressor')
+                        for gen_config in unified_params.get('generator_configs', []):
+                            if (gen_config['method'] == method and 
+                                gen_config['generator_module_type'] == gen_type and 
+                                model in gen_config['models']):
+                                if gen_type == 'sap_api':
+                                    final_config['compressor_api_url'] = gen_config.get('api_url')
+                                    final_config['compressor_llm'] = gen_config.get('llm', 'mistralai')
+                                else:
+                                    final_config['compressor_llm'] = gen_config.get('llm', 'openai')
+                                break
+                    
+                    final_config.pop('passage_compressor_config', None)
+            else:
+                final_config['passage_compressor_method'] = 'pass_compressor'
+                final_config.pop('passage_compressor_config', None)
+        
+        if component == 'prompt_maker_generator' and 'generator_config' in final_config:
+            gen_config_str = final_config['generator_config']
+            parts = gen_config_str.split('::', 2)
+            if len(parts) >= 2:
+                gen_type = parts[0]
+                model = parts[1]
+                final_config['generator_module_type'] = gen_type
+                final_config['generator_model'] = model
+                
+                gen_node_config = self.config_generator.extract_node_config("generator")
+                for module in gen_node_config.get("modules", []):
+                    if module.get("module_type") == gen_type:
+                        models = module.get('model', module.get('llm', []))
+                        if not isinstance(models, list):
+                            models = [models]
+                        if model in models:
+                            if gen_type == 'sap_api':
+                                final_config['generator_api_url'] = module.get('api_url')
+                                final_config['generator_llm'] = module.get('llm', 'mistralai')
+                            else:
+                                final_config['generator_llm'] = module.get('llm', 'openai')
+                            break
+            
+            final_config.pop('generator_config', None)
+        
+        return final_config

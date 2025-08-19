@@ -50,8 +50,8 @@ class ComponentPipelineManager:
             shutil.copy2(centralized_corpus_path, trial_corpus_path)
     
     def save_component_output(self, component: str, trial_dir: str, 
-                              results: Dict[str, Any], qa_data: pd.DataFrame) -> str:
-        output_df = qa_data.copy()
+                      results: Dict[str, Any], working_df: pd.DataFrame) -> str:
+        output_df = working_df.copy()
         
         if component == 'query_expansion':
             if 'retrieval_df' in results:
@@ -64,34 +64,48 @@ class ComponentPipelineManager:
                         output_df['queries'] = retrieval_df['queries']
             
             for col in ['retrieved_ids', 'retrieved_contents', 'retrieve_scores', 'queries']:
-                if col in qa_data.columns and col not in output_df.columns:
-                    output_df[col] = qa_data[col]
+                if col in working_df.columns and col not in output_df.columns:
+                    output_df[col] = working_df[col]
         
         elif component == 'retrieval':
             retrieval_columns = ['retrieved_ids', 'retrieved_contents', 'retrieve_scores']
             for col in retrieval_columns:
-                if col in qa_data.columns:
-                    output_df[col] = qa_data[col]
+                if col in working_df.columns:
+                    output_df[col] = working_df[col]
             
-            if 'queries' in qa_data.columns:
-                output_df['queries'] = qa_data['queries']
+            if 'queries' in working_df.columns:
+                output_df['queries'] = working_df['queries']
         
         elif component in ['passage_reranker', 'passage_filter', 'passage_compressor']:
             base_columns = ['query', 'retrieval_gt', 'generation_gt', 'qid']
-            for col in qa_data.columns:
+            for col in working_df.columns:
                 if col not in base_columns and col not in output_df.columns:
-                    output_df[col] = qa_data[col]
+                    output_df[col] = working_df[col]
         
         elif component == 'prompt_maker_generator':
-            for col in qa_data.columns:
+            for col in working_df.columns:
                 if col not in output_df.columns:
-                    output_df[col] = qa_data[col]
+                    output_df[col] = working_df[col]
             
-            if 'eval_df' in results and isinstance(results['eval_df'], pd.DataFrame):
-                eval_df = results['eval_df']
-                for col in ['generated_texts', 'prompts']:
-                    if col in eval_df.columns:
-                        output_df[col] = eval_df[col]
+            if 'generated_texts' in results:
+                output_df['generated_texts'] = results['generated_texts']
+            
+            if 'prompts' in working_df.columns:
+                output_df['prompts'] = working_df['prompts']
+            
+            if 'generation_metrics' in results and isinstance(results['generation_metrics'], dict):
+                for metric_name, metric_values in results['generation_metrics'].items():
+                    if isinstance(metric_values, list) and len(metric_values) == len(output_df):
+                        output_df[f'generation_{metric_name}_score'] = metric_values
+                    elif isinstance(metric_values, (int, float)):
+                        output_df[f'generation_{metric_name}_score'] = metric_values
+            
+            if 'generation_score' in results:
+                output_df['generation_score'] = results['generation_score']
+            
+            print(f"[{component}] Saving output with columns: {list(output_df.columns)}")
+            if 'generated_texts' in output_df.columns:
+                print(f"[{component}] Generated texts sample: {output_df['generated_texts'].iloc[0][:100]}...")
         
         output_path = os.path.join(trial_dir, f"{component}_output.parquet")
         output_df.to_parquet(output_path)
@@ -119,17 +133,6 @@ class ComponentPipelineManager:
                 return results.get('prompt_maker_score', results.get('last_retrieval_score', 0.0))
         else:
             return results.get('combined_score', 0.0)
-    
-    def is_pass_component(self, component: str, config: Dict[str, Any]) -> bool:
-        if component == 'passage_filter' and config.get('passage_filter_method') == 'pass_passage_filter':
-            return True
-        elif component == 'passage_reranker' and config.get('passage_reranker_method') == 'pass_reranker':
-            return True
-        elif component == 'passage_compressor' and config.get('passage_compressor_method') == 'pass_compressor':
-            return True
-        elif component == 'query_expansion' and config.get('query_expansion_method') == 'pass_query_expansion':
-            return True
-        return False
     
     def extract_detailed_metrics(self, component: str, results: Dict[str, Any]) -> Dict[str, Any]:
         detailed_metrics = {}

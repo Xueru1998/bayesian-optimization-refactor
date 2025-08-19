@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from pathlib import Path
 import yaml
 import shutil
 import numpy as np
@@ -14,11 +15,10 @@ from smac.intensifier import Hyperband, SuccessiveHalving
 from smac.initial_design import SobolInitialDesign
 from smac.callback import Callback
 import itertools
-from pathlib import Path
 from ConfigSpace import ConfigurationSpace, Configuration
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.search_space_calculator import SearchSpaceCalculator
+from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
 from smac3.local_optimization.componentwise_config_space_builder import ComponentwiseSMACConfigSpaceBuilder
 from pipeline.wandb_logger import WandBLogger
@@ -55,7 +55,7 @@ class ComponentwiseSMACOptimizer:
         seed: int = 42,
         early_stopping_threshold: float = 0.9,
         use_wandb: bool = True,
-        wandb_project: str = "Component-wise SMAC Optimization",
+        wandb_project: str = "Componentwise Optimization",
         wandb_entity: Optional[str] = None,
         optimizer: str = "smac", 
         use_multi_fidelity: bool = False,
@@ -64,8 +64,14 @@ class ComponentwiseSMACOptimizer:
         eta: int = 3,
         use_multi_objective: bool = False,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o" 
+        llm_evaluator_config: Optional[Dict[str, Any]] = None,
+        search_type: str = "bo",
     ):
+        print(f"[ComponentwiseSMACOptimizer] Initializing with:")
+        print(f"  use_llm_compressor_evaluator: {use_llm_compressor_evaluator}")
+        print(f"  llm_evaluator_config: {llm_evaluator_config}")
+        print(f"  seed: {seed}")
+            
         self.config_template = config_template
         self.qa_data = qa_data
         self.corpus_data = corpus_data
@@ -97,12 +103,10 @@ class ComponentwiseSMACOptimizer:
         
         self.min_budget = max(1, int(self.total_samples * self.min_budget_percentage))
         self.max_budget = max(self.min_budget, int(self.total_samples * self.max_budget_percentage))
-        self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
-        self.llm_evaluator_model = llm_evaluator_model
         
         self.component_detailed_metrics = {} 
         
-        self.study_name = study_name if study_name else f"componentwise_smac_local_model_{int(time.time())}"
+        self.study_name = study_name if study_name else f"componentwise_smac_sap_api_{int(time.time())}"
         
         if result_dir:
             self.result_dir = result_dir
@@ -113,8 +117,12 @@ class ComponentwiseSMACOptimizer:
             )
         os.makedirs(self.result_dir, exist_ok=True)
         
+        self.search_type = search_type
         self.config_generator = ConfigGenerator(self.config_template)
-        self.search_space_calculator = SearchSpaceCalculator(self.config_generator)
+        self.combination_calculator = CombinationCalculator(
+            config_generator=self.config_generator,
+            search_type=self.search_type
+        )
         self.config_space_builder = ComponentwiseSMACConfigSpaceBuilder(self.config_generator, seed=self.seed)
         
         self.rag_processor = ComponentwiseRAGProcessor(
@@ -124,8 +132,9 @@ class ComponentwiseSMACOptimizer:
             project_dir=self.project_dir,
             corpus_data=self.corpus_data,
             qa_data=self.qa_data,
-            use_llm_compressor_evaluator=use_llm_compressor_evaluator,
-            llm_evaluator_model=self.llm_evaluator_model,
+            use_llm_evaluator=use_llm_compressor_evaluator,
+            llm_evaluator_config=llm_evaluator_config,
+            search_type=self.search_type,
         )
         
         self.component_results = {}
@@ -133,6 +142,9 @@ class ComponentwiseSMACOptimizer:
         self.component_dataframes = {}
         self.current_trial = 0
         self.trial_results = []
+        
+        self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
+        self.llm_evaluator_config = llm_evaluator_config or {}
         
         Utils.ensure_centralized_data(self.project_dir, self.corpus_data, self.qa_data)
         
@@ -156,7 +168,21 @@ class ComponentwiseSMACOptimizer:
     def optimize(self) -> Dict[str, Any]:
         start_time = time.time()
         
-        self._validate_all_components()
+        components_with_small_space, component_combinations, component_notes = self._validate_all_components()
+        
+        if components_with_small_space:
+            n_trials = self.n_trials_per_component if self.n_trials_per_component else 20
+            print(f"\n{'='*70}")
+            print(f"WARNING: Small search spaces detected!")
+            print(f"The following components have search spaces smaller than n_trials ({n_trials}):")
+            for comp in components_with_small_space:
+                print(f"  - {comp}: only {component_combinations[comp]} combinations")
+                print(f"    Note: {component_notes[comp]}")
+            print(f"\nOptimization will continue, but may sample repeated configurations.")
+            print(f"Consider:")
+            print(f"  1. Adding more hyperparameters or values to these components")
+            print(f"  2. Reducing n_trials_per_component to {min(component_combinations[comp] for comp in components_with_small_space)}")
+            print(f"{'='*70}\n")
         
         all_results = {
             'study_name': self.study_name,
@@ -166,7 +192,10 @@ class ComponentwiseSMACOptimizer:
             'component_order': [],
             'early_stopped': False,
             'retrieval_weight': self.retrieval_weight,
-            'generation_weight': self.generation_weight
+            'generation_weight': self.generation_weight,
+            'components_with_small_space': components_with_small_space,
+            'component_combinations': component_combinations,
+            'component_notes': component_notes
         }
         
         active_components = self._get_active_components()
@@ -302,16 +331,16 @@ class ComponentwiseSMACOptimizer:
         self._save_component_result(trial_component_dir, result)
         
         return result
-    
+
     def _component_target_function(self, config: Configuration, seed: int, component: str, 
-                 fixed_components: Dict[str, Any], budget: float = None) -> float:
+                             fixed_components: Dict[str, Any], budget: float = None) -> float:
         trial_config = dict(config)
         
         trial_config, is_pass_component = self.rag_processor.parse_trial_config(component, trial_config)
         
         full_config = {**fixed_components, **trial_config}
-
-        print(f"[DEBUG] Full config being sent to pipeline: {full_config}")
+        
+        print(f"\n[DEBUG] Trial {self.current_trial + 1} config from SMAC: {dict(config)}")
         print(f"[DEBUG] Is pass component: {is_pass_component}")
         
         cleaned_config = self.config_space_builder.clean_trial_config(full_config)
@@ -349,9 +378,10 @@ class ComponentwiseSMACOptimizer:
                 cleaned_config,
                 trial_dir,
                 qa_subset,
-                component, 
-                self.component_results 
+                component,
+                self.component_results
             )
+
             
             working_df = results.pop('working_df', qa_subset)
 
@@ -381,8 +411,8 @@ class ComponentwiseSMACOptimizer:
             print(f"[{component}] Trial score: {score:.4f}, Current best: {current_best_score:.4f}")
 
             if score > current_best_score:
-                print(f"[{component}] New best score: {score:.4f}, updating best output to: {output_parquet_path}")
                 self.component_dataframes[component] = output_parquet_path
+                print(f"[{component}] New best score: {score:.4f}, saving output to: {output_parquet_path}")
 
                 if component not in self.component_results:
                     self.component_results[component] = {}
@@ -430,7 +460,7 @@ class ComponentwiseSMACOptimizer:
             empty_output_df.to_parquet(output_path)
             
             return 0.0
-        
+    
     def _create_scenario(self, cs: ConfigurationSpace, component: str, n_trials: int) -> Scenario:
         component_dir, smac_run_dir, seed_dir = self._ensure_smac_directories(component)
         
@@ -509,12 +539,13 @@ class ComponentwiseSMACOptimizer:
                     overwrite=True
                 )
 
-    def _get_component_combinations(self, component: str) -> int:
-        return self.rag_processor.get_component_combinations(
+    def _get_component_combinations(self, component: str) -> Tuple[int, str]:
+        combinations, note = self.rag_processor.get_component_combinations(
             component, 
             self.config_space_builder,
             self.best_configs
         )
+        return combinations, note
     
     def _create_early_stopping_callback(self):
         class EarlyStoppingCallback(Callback):
@@ -539,7 +570,7 @@ class ComponentwiseSMACOptimizer:
         
         return EarlyStoppingCallback(self.early_stopping_threshold)
     
-    def _validate_all_components(self) -> Tuple[bool, List[str], Dict[str, int]]:
+    def _validate_all_components(self) -> Tuple[List[str], Dict[str, int], Dict[str, str]]:
         active_components = []
         has_active_query_expansion = False
         
@@ -571,41 +602,20 @@ class ComponentwiseSMACOptimizer:
                     active_components.append(comp)
         
         component_combinations = {}
+        component_notes = {}
+        components_with_small_space = []
         
         n_trials = self.n_trials_per_component if self.n_trials_per_component else 20
         
         for component in active_components:
-            combinations = self._get_component_combinations(component)
+            combinations, note = self._get_component_combinations(component)
             component_combinations[component] = combinations
-        
-        print(f"\n{'='*70}")
-        print(f"COMPONENT VALIDATION PASSED")
-        print(f"All components have sufficient search space for optimization:")
-        
-        for component in active_components:
-            combos = component_combinations[component]
+            component_notes[component] = note
             
-            if combos == 0:
-                print(f"  - {component}: No search space (will be skipped)")
-                continue
-                
-            print(f"  - {component}: {combos} combinations")
-            
-            if combos < n_trials and combos > 0:
-                print(f"    ⚠️  WARNING: Search space ({combos}) < n_trials ({n_trials})")
-                print(f"       SMAC uses Bayesian Optimization with continuous sampling within parameter ranges.")
-                print(f"       While the discrete combination count is limited, SMAC can explore")
-                print(f"       continuous values between boundaries for numerical parameters.")
-                
-                if component == 'passage_filter':
-                    print(f"       For filters, thresholds/percentiles are sampled continuously.")
-                elif component == 'passage_compressor':
-                    print(f"       For compressors, compression ratios and other numerical")
-                    print(f"       parameters are sampled continuously within their ranges.")
+            if combinations < n_trials and combinations > 0:
+                components_with_small_space.append(component)
         
-        print(f"{'='*70}\n")
-
-        return True, [], component_combinations
+        return components_with_small_space, component_combinations, component_notes
     
     def _get_active_components(self) -> List[str]:
         active_components = []
@@ -650,45 +660,18 @@ class ComponentwiseSMACOptimizer:
         return False
     
     def _calculate_component_trials(self, component: str, cs: ConfigurationSpace) -> int:
-        total_combinations = self._get_component_combinations(component)
+        total_combinations, note = self._get_component_combinations(component)
         
-        if self.n_trials_per_component:
-            return self.n_trials_per_component
-
+        print(f"[{component}] {note}")
         print(f"[{component}] Total combinations: {total_combinations}")
         
+        if self.n_trials_per_component:
+            if total_combinations < self.n_trials_per_component:
+                print(f"[{component}] WARNING: Only {total_combinations} unique combinations available, but {self.n_trials_per_component} trials requested.")
+                print(f"[{component}] Some configurations may be sampled multiple times.")
+            return self.n_trials_per_component
+        
         return min(20, total_combinations)
-
-    def _run_grid_search(self, component: str, cs: ConfigurationSpace, 
-                        fixed_config: Dict[str, Any]) -> Configuration:
-        print(f"\n[{component}] Using GRID SEARCH optimization")
-        print(f"[{component}] Generating all possible configurations...")
-
-        all_configs = self._generate_grid_search_configs(cs)
-        
-        if not all_configs:
-            print(f"[WARNING] No valid configurations generated for {component}")
-            return None
-        
-        print(f"[{component}] Evaluating {len(all_configs)} configurations...")
-
-        best_score = -float('inf')
-        best_config = None
-        
-        for i, config in enumerate(all_configs):
-            print(f"\n[{component}] Grid search {i+1}/{len(all_configs)}")
-
-            score = self._component_target_function(config, seed=42, component=component, 
-                                                fixed_components=fixed_config, budget=None)
-
-            actual_score = -score
-            
-            if actual_score > best_score:
-                best_score = actual_score
-                best_config = config
-                print(f"[{component}] New best score: {best_score:.4f}")
-
-        return best_config
     
     def _run_smac_optimization(self, component: str, cs: ConfigurationSpace, 
                              fixed_config: Dict[str, Any], n_trials: int) -> Configuration:
@@ -715,160 +698,17 @@ class ComponentwiseSMACOptimizer:
         try:
             incumbent = smac.optimize()
         except Exception as e:
-            print(f"[ERROR] SMAC optimization failed for {component}: {str(e)}")
-            
-            component_dir, smac_run_dir, seed_dir = self._ensure_smac_directories(component)            
+            print(f"[ERROR] SMAC optimization failed for {component}: {str(e)}")            
             raise
         
         return incumbent
-
-    def _generate_grid_search_configs(self, cs: ConfigurationSpace) -> List[Configuration]:
-        configs = []
-
-        hyperparameters = cs.get_hyperparameters()
-        
-        if not hyperparameters:
-            return []
-
-        unconditional_params = {}
-        conditional_params = {}
-        
-        for hp in hyperparameters:
-            if cs.get_parents_of(hp):
-                conditional_params[hp.name] = hp
-            else:
-                if hasattr(hp, 'choices'): 
-                    unconditional_params[hp.name] = hp.choices
-                elif hasattr(hp, 'lower') and hasattr(hp, 'upper'): 
-                    if isinstance(hp.lower, int) and isinstance(hp.upper, int):
-                        if hp.upper - hp.lower <= 20:
-                            unconditional_params[hp.name] = list(range(hp.lower, hp.upper + 1))
-                        else:
-                            unconditional_params[hp.name] = np.linspace(hp.lower, hp.upper, 10, dtype=int).tolist()
-                    else:
-                        unconditional_params[hp.name] = np.linspace(hp.lower, hp.upper, 10).tolist()
-                else:
-                    unconditional_params[hp.name] = [hp.default_value]
-
-        if unconditional_params:
-            keys = list(unconditional_params.keys())
-            values = list(unconditional_params.values())
-            
-            for combination in itertools.product(*values):
-                base_config = dict(zip(keys, combination))
-
-                try:
-                    partial_config = Configuration(cs, values=base_config, allow_inactive=True)
-
-                    configs_with_conditionals = [base_config.copy()]
-                    
-                    for cond_name, cond_hp in conditional_params.items():
-                        parents = cs.get_parents_of(cond_hp)
-                        is_active = True
-                        
-                        for parent in parents:
-                            parent_value = base_config.get(parent.name)
-                            conditions = cs.get_children_of(parent)
-
-                            for child, condition in conditions:
-                                if child.name == cond_name:
-                                    if hasattr(condition, 'value') and parent_value != condition.value:
-                                        is_active = False
-                                        break
-                                    elif hasattr(condition, 'values') and parent_value not in condition.values:
-                                        is_active = False
-                                        break
-                        
-                        if is_active:
-                            new_configs = []
-                            cond_values = []
-                            
-                            if hasattr(cond_hp, 'choices'):
-                                cond_values = cond_hp.choices
-                            elif hasattr(cond_hp, 'lower') and hasattr(cond_hp, 'upper'):
-                                if isinstance(cond_hp.lower, int) and isinstance(cond_hp.upper, int):
-                                    if cond_hp.upper - cond_hp.lower <= 20:
-                                        cond_values = list(range(cond_hp.lower, cond_hp.upper + 1))
-                                    else:
-                                        cond_values = np.linspace(cond_hp.lower, cond_hp.upper, 10, dtype=int).tolist()
-                                else:
-                                    cond_values = np.linspace(cond_hp.lower, cond_hp.upper, 10).tolist()
-                            else:
-                                cond_values = [cond_hp.default_value]
-                            
-                            for existing_config in configs_with_conditionals:
-                                for cond_value in cond_values:
-                                    new_config = existing_config.copy()
-                                    new_config[cond_name] = cond_value
-                                    new_configs.append(new_config)
-                            
-                            if new_configs:
-                                configs_with_conditionals = new_configs
-
-                    for final_config in configs_with_conditionals:
-                        try:
-                            config = Configuration(cs, values=final_config)
-                            configs.append(config)
-                        except:
-                            continue
-                            
-                except:
-                    continue
-        
-        print(f"Generated {len(configs)} configurations for grid search")
-        return configs
     
-    def _find_best_trial(self, component: str) -> Optional[Dict[str, Any]]:
-        best_trial = None
-        best_score = -float('inf')
-        best_latency = float('inf')
+    def _find_best_trial(self, component: str) -> Optional[Dict]:
+        return Utils.find_best_trial_from_component(self.component_trials, component)
 
-        score_groups = {}
-        for trial in self.component_trials:
-            score = trial['score']
-            if score not in score_groups:
-                score_groups[score] = []
-            score_groups[score].append(trial)
-
-        if score_groups:
-            max_score = max(score_groups.keys())
-            trials_with_max_score = score_groups[max_score]
-
-            if len(trials_with_max_score) > 1:
-                print(f"[{component}] Found {len(trials_with_max_score)} trials with score {max_score:.4f}, selecting by latency")
-                best_trial = min(trials_with_max_score, key=lambda t: t.get('latency', float('inf')))
-                print(f"[{component}] Selected trial {best_trial['trial_number']} with latency {best_trial['latency']:.2f}s")
-            else:
-                best_trial = trials_with_max_score[0]
-            
-            best_score = best_trial['score']
-            best_latency = best_trial.get('latency', 0.0)
-
-        for trial in self.component_trials:
-            trial_config = trial.get('config', {})
-            is_pass = self._is_pass_configuration(component, trial_config)
-
-            if is_pass and trial['score'] == best_score and trial.get('latency', 0) < best_latency:
-                print(f"[{component}] Preferring pass configuration with same score but lower latency")
-                best_trial = trial
-                best_latency = trial.get('latency', 0.0)
-
-        return best_trial
-    
-    def _is_pass_configuration(self, component: str, config: Dict[str, Any]) -> bool:
-        if component == 'passage_filter' and config.get('passage_filter_method') == 'pass_passage_filter':
-            return True
-        elif component == 'passage_reranker' and config.get('passage_reranker_method') == 'pass_reranker':
-            return True
-        elif component == 'passage_compressor' and config.get('passage_compressor_method') == 'pass_compressor':
-            return True
-        elif component == 'query_expansion' and config.get('query_expansion_method') == 'pass_query_expansion':
-            return True
-        return False
-    
     def _create_component_result(self, component: str, best_trial: Optional[Dict[str, Any]], 
-                           best_config: Dict[str, Any], fixed_config: Dict[str, Any],
-                           cs: ConfigurationSpace, start_time: float) -> Dict[str, Any]:
+                               best_config: Dict[str, Any], fixed_config: Dict[str, Any],
+                               cs: ConfigurationSpace, start_time: float) -> Dict[str, Any]:
         if not best_trial and not self.component_trials:
             print(f"[WARNING] No successful trials for component {component}")
             return {
@@ -882,7 +722,7 @@ class ComponentwiseSMACOptimizer:
                 'search_space_size': len(cs.get_hyperparameters()),
                 'optimization_time': time.time() - start_time,
                 'detailed_metrics': [],
-                'optimization_method': 'smac'  
+                'optimization_method': 'smac'
             }
 
         return {
@@ -898,7 +738,7 @@ class ComponentwiseSMACOptimizer:
             'optimization_time': time.time() - start_time,
             'detailed_metrics': self.component_detailed_metrics.get(component, []),
             'best_output_path': best_trial.get('output_parquet') if best_trial else None,
-            'optimization_method': 'smac' 
+            'optimization_method': 'smac'
         }
     
     def _create_trial_result(self, config_dict, score, latency, budget, budget_percentage, 
@@ -935,31 +775,8 @@ class ComponentwiseSMACOptimizer:
         if os.path.exists(centralized_corpus_path) and not os.path.exists(trial_corpus_path):
             shutil.copy2(centralized_corpus_path, trial_corpus_path)
     
-    def _convert_numpy_types(self, obj):    
-        if isinstance(obj, pd.DataFrame):
-            return None  
-        elif isinstance(obj, (np.integer, np.int64, np.int32)):
-            return int(obj)
-        elif isinstance(obj, np.floating): 
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            result = {}
-            for k, v in obj.items():
-                converted = self._convert_numpy_types(v)
-                if converted is not None: 
-                    result[k] = converted
-            return result
-        elif isinstance(obj, list):
-            result = []
-            for item in obj:
-                converted = self._convert_numpy_types(item)
-                if converted is not None:  
-                    result.append(converted)
-            return result
-        else:
-            return obj
+    def _convert_numpy_types(self, obj):
+        return Utils.convert_numpy_types(obj)
     
     def _save_component_result(self, component_dir: str, result: Dict[str, Any]):
         result_for_json = result.copy()
@@ -1037,26 +854,9 @@ class ComponentwiseSMACOptimizer:
             json.dump(error_results_serializable, f, indent=2)
     
     def _save_final_results(self, results: Dict[str, Any]):
-        summary_file = os.path.join(self.result_dir, "component_optimization_summary.json")
-
-        results_serializable = self._convert_numpy_types(results)
-        
-        with open(summary_file, 'w') as f:
-            json.dump(results_serializable, f, indent=2)
-        
-        if not results.get('validation_failed', False):
-            final_config = {}
-            for component in results['component_order']:
-                if component in results['best_configs'] and results['best_configs'][component]:
-                    final_config.update(results['best_configs'][component])
-            
-            if final_config:
-                final_config_file = os.path.join(self.result_dir, "final_best_config.yaml")
-                final_config_serializable = self._convert_numpy_types(final_config)
-                with open(final_config_file, 'w') as f:
-                    yaml.dump(self.config_generator.generate_trial_config(final_config_serializable), f)
-            else:
-                print("Warning: No successful configurations found, skipping final config generation")
+        Utils.save_component_optimization_results(
+            self.result_dir, results, self.config_generator
+        )
     
     def _print_final_summary(self, results: Dict[str, Any]):
         print(f"\nTotal optimization time: {Utils.format_time_duration(results['optimization_time'])}")

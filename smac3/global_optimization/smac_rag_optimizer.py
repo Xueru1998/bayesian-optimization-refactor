@@ -17,8 +17,8 @@ from smac.facade import AbstractFacade
 from smac.callback import Callback
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
-from pipeline.search_space_calculator import SearchSpaceCalculator
+from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
+from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
 from smac3.global_optimization.config_space_builder import SMACConfigSpaceBuilder
 from pipeline.wandb_logger import WandBLogger
@@ -53,12 +53,18 @@ class SMACRAGOptimizer:
         min_budget_percentage: float = 0.1,
         max_budget_percentage: float = 1.0,
         eta: int = 3,
-        use_ragas: bool = False,  
+        use_ragas: bool = False,
         ragas_config: Optional[Dict[str, Any]] = None,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o" 
+        llm_evaluator_config: Optional[Dict[str, Any]] = None
     ):
+        print(f"[SMACRAGOptimizer] Initializing with:")
+        print(f"  use_llm_compressor_evaluator: {use_llm_compressor_evaluator}")
+        print(f"  llm_evaluator_config: {llm_evaluator_config}")
+        
         self.start_time = time.time()
+        
+        self.early_stopped_trials = []
         
         self._initialize_paths(project_dir, result_dir)
         self._initialize_data(config_template, qa_data, corpus_data)
@@ -66,13 +72,12 @@ class SMACRAGOptimizer:
             n_trials, sample_percentage, cpu_per_trial, retrieval_weight,
             generation_weight, use_cached_embeddings, walltime_limit, n_workers,
             seed, early_stopping_threshold, optimizer, use_multi_fidelity,
-            min_budget_percentage, max_budget_percentage, eta, use_ragas, ragas_config 
+            min_budget_percentage, max_budget_percentage, eta, use_ragas, ragas_config,
+            use_llm_compressor_evaluator, llm_evaluator_config
         )
         self._initialize_wandb_params(use_wandb, wandb_project, wandb_entity, wandb_run_name)
-        self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
-        self.llm_evaluator_model = llm_evaluator_model
         
-        self.study_name = study_name if study_name else f"{optimizer}_opt_{int(time.time())}"
+        self.study_name = study_name if study_name else f"{optimizer}_opt_SAP_api_scifact_{int(time.time())}"
         
         self._setup_components()
         self._calculate_trials_if_needed()
@@ -83,6 +88,7 @@ class SMACRAGOptimizer:
         self.all_trials = []
         
         self._print_initialization_summary()
+    
     
     def _initialize_paths(self, project_dir: str, result_dir: Optional[str]):
         self.project_root = Utils.find_project_root()
@@ -105,10 +111,11 @@ class SMACRAGOptimizer:
         self.total_samples = len(qa_data)
     
     def _initialize_optimization_params(self, n_trials, sample_percentage, cpu_per_trial,
-                                      retrieval_weight, generation_weight, use_cached_embeddings,
-                                      walltime_limit, n_workers, seed, early_stopping_threshold,
-                                      optimizer, use_multi_fidelity, min_budget_percentage,
-                                      max_budget_percentage, eta, use_ragas, ragas_config):
+                                  retrieval_weight, generation_weight, use_cached_embeddings,
+                                  walltime_limit, n_workers, seed, early_stopping_threshold,
+                                  optimizer, use_multi_fidelity, min_budget_percentage,
+                                  max_budget_percentage, eta, use_ragas, ragas_config,
+                                  use_llm_compressor_evaluator, llm_evaluator_config):
         self.n_trials = n_trials
         self.sample_percentage = sample_percentage
         self.cpu_per_trial = cpu_per_trial
@@ -132,6 +139,8 @@ class SMACRAGOptimizer:
         self.max_budget = max(self.min_budget, int(self.total_samples * self.max_budget_percentage))
         self.use_ragas = use_ragas  
         self.ragas_config = ragas_config  
+        self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
+        self.llm_evaluator_config = llm_evaluator_config
         
     def _initialize_wandb_params(self, use_wandb, wandb_project, wandb_entity, wandb_run_name):
         self.use_wandb = use_wandb
@@ -141,7 +150,10 @@ class SMACRAGOptimizer:
     
     def _setup_components(self):
         self.config_generator = ConfigGenerator(self.config_template)
-        self.search_space_calculator = SearchSpaceCalculator(self.config_generator)
+        self.combination_calculator = CombinationCalculator(
+            self.config_generator,
+            search_type='bo'
+        )
         self.config_space_builder = SMACConfigSpaceBuilder(self.config_generator, seed=self.seed)
         
         self._setup_runner()
@@ -155,13 +167,19 @@ class SMACRAGOptimizer:
         self.prompt_maker_metrics = self.config_generator.extract_generation_metrics_from_config('prompt_maker')
         self.query_expansion_metrics = self.config_generator.extract_query_expansion_metrics_from_config()
 
-        use_ragas = self.use_ragas  
+        use_ragas = self.use_ragas
         
         ragas_config = self.ragas_config or {
             'retrieval_metrics': ["context_precision", "context_recall"],
             'generation_metrics': ["answer_relevancy", "faithfulness", "factual_correctness", "semantic_similarity"],
             'llm_model': "gpt-4o-mini",
-            'embedding_model': "text-embedding-ada-002" 
+            'embedding_model': "text-embedding-ada-002"
+        }
+        
+        use_llm_evaluator = self.use_llm_compressor_evaluator
+        llm_evaluator_config = self.llm_evaluator_config or {
+            "llm_model": "gpt-4o",
+            "temperature": 0.0
         }
         
         self.runner = RAGPipelineRunner(
@@ -175,28 +193,119 @@ class SMACRAGOptimizer:
             reranker_metrics=self.reranker_metrics,
             retrieval_weight=self.retrieval_weight,
             generation_weight=self.generation_weight,
-            use_ragas=use_ragas, 
+            use_ragas=use_ragas,
             ragas_config=ragas_config,
-            use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-            llm_evaluator_model=self.llm_evaluator_model  
+            use_llm_evaluator=use_llm_evaluator,
+            llm_evaluator_config=llm_evaluator_config
         )
     
     def _calculate_trials_if_needed(self):
         if self.n_trials is None:
-            suggestion = self.search_space_calculator.suggest_num_samples(
-                sample_percentage=self.sample_percentage,
-                min_samples=20,
-                max_samples=50,
-                max_combinations=500
-            )
-            self.n_trials = suggestion['num_samples']
-            print(f"Use Default num_trials: {self.n_trials}")
-        else:
-            self.n_trials = max(20, self.n_trials)
-            if self.n_trials < 20:
-                print(f"Minimum 20 trials recommended for SMAC. Increased to {self.n_trials}")
+            search_space_size, note = self._calculate_total_search_space()
+            
+            import math
+            if search_space_size > 500:
+                log_combinations = math.log10(search_space_size)
+                log_max = math.log10(500)
+                suggested_samples = int(20 + (50 - 20) * min(log_combinations / log_max, 1.0))
+                self.n_trials = 50
+                reasoning = f"Large search space detected ({search_space_size:,} combinations), using max samples (50) for better coverage. {note}"
             else:
-                print(f"Using provided num_trials: {self.n_trials}")
+                suggested_samples = max(20, int(search_space_size * self.sample_percentage))
+                self.n_trials = min(suggested_samples, 50)
+                reasoning = f"Auto-calculated based on {self.sample_percentage*100}% of {search_space_size} total combinations. {note}"
+            
+            print(f"Auto-calculated num_trials: {self.n_trials}")
+            print(f"Reasoning: {reasoning}")
+        else:
+            print(f"Using provided num_trials: {self.n_trials}")
+            
+    def _calculate_total_search_space(self) -> Tuple[int, str]:
+        components = [
+            'query_expansion', 'retrieval', 'passage_filter',
+            'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+        ]
+        
+        total_combinations = 1
+        combination_note = ""
+        
+        has_active_qe = False
+        if self.config_generator.node_exists("query_expansion"):
+            qe_config = self.config_generator.extract_node_config("query_expansion")
+            if qe_config and qe_config.get("modules", []):
+                for module in qe_config.get("modules", []):
+                    if module.get("module_type") != "pass_query_expansion":
+                        has_active_qe = True
+                        break
+        
+        for component in components:
+            if component == 'retrieval' and has_active_qe:
+                continue
+            
+            combos, note = self.combination_calculator.calculate_component_combinations(component)
+            combination_note = note
+            
+            if combos > 0:
+                total_combinations *= combos
+        
+        return total_combinations, combination_note
+    
+    def _get_search_space_summary(self) -> Dict[str, Any]:
+        components = [
+            'query_expansion', 'retrieval', 'passage_filter',
+            'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+        ]
+        
+        summary = {}
+        total_combinations = 1
+        combination_note = ""
+        
+        has_active_qe = False
+        if self.config_generator.node_exists("query_expansion"):
+            qe_config = self.config_generator.extract_node_config("query_expansion")
+            if qe_config and qe_config.get("modules", []):
+                for module in qe_config.get("modules", []):
+                    if module.get("module_type") != "pass_query_expansion":
+                        has_active_qe = True
+                        break
+        
+        for component in components:
+            if component == 'retrieval' and has_active_qe:
+                summary[component] = {
+                    'combinations': 0,
+                    'config': None,
+                    'skipped_when_qe_active': True
+                }
+                continue
+            
+            combos, note = self.combination_calculator.calculate_component_combinations(component)
+            combination_note = note
+            
+            config = None
+            if component == 'query_expansion':
+                config = self.config_generator.extract_node_config("query_expansion")
+            elif component == 'retrieval':
+                config = self.config_generator.extract_retrieval_options()
+            elif component == 'prompt_maker_generator':
+                config = {
+                    'prompt_maker': self.config_generator.extract_node_config("prompt_maker"),
+                    'generator': self.config_generator.extract_node_config("generator")
+                }
+            else:
+                config = self.config_generator.extract_node_config(component.replace('_', '-'))
+            
+            summary[component] = {
+                'combinations': combos,
+                'config': config
+            }
+            
+            if combos > 0:
+                total_combinations *= combos
+        
+        summary['search_space_size'] = total_combinations
+        summary['combination_note'] = combination_note
+        
+        return summary
     
     def _ensure_conditional_parameters(self, config_dict: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
         if seed is None:
@@ -222,6 +331,40 @@ class SMACRAGOptimizer:
                     del config_dict[param]
             
             print(f"[CONSTRAINT] Set passage_filter to 'pass' because {reranker_key}=1")
+            
+        if 'passage_compressor_config' in config_dict:
+            comp_config_str = config_dict['passage_compressor_config']
+            
+            if comp_config_str != 'pass_compressor' and '::' in comp_config_str:
+                parts = comp_config_str.split('::', 3)
+
+                if len(parts) >= 3:
+                    method, gen_type, model = parts[0], parts[1], parts[2]
+
+                    unified_params = self.config_generator.extract_unified_parameters('passage_compressor')
+                    valid_config = False
+                    
+                    for comp_config in unified_params.get('compressor_configs', []):
+                        if (comp_config['method'] == method and 
+                            comp_config['generator_module_type'] == gen_type and 
+                            model in comp_config['models']):
+                            valid_config = True
+                            break
+                    
+                    if not valid_config:
+                        print(f"[WARNING] Invalid compressor config: {comp_config_str}")
+                        config_dict['passage_compressor_config'] = 'pass_compressor'
+                        config_dict['passage_compressor_method'] = 'pass_compressor'
+
+        if 'passage_compressor_method' in config_dict and config_dict['passage_compressor_method'] not in ['pass_compressor', 'pass']:
+            if 'compressor_temperature' not in config_dict:
+                config_dict['compressor_temperature'] = 0.7
+                print(f"[DEBUG] Added default compressor_temperature: 0.7")
+
+            if 'compressor_generator_module_type' in config_dict and config_dict['compressor_generator_module_type'] == 'sap_api':
+                if 'compressor_max_tokens' not in config_dict:
+                    config_dict['compressor_max_tokens'] = 500
+                    print(f"[DEBUG] Added default compressor_max_tokens: 500 for SAP API")
 
         if 'query_expansion_method' in config_dict and config_dict['query_expansion_method'] != 'pass_query_expansion':
             for param in ['retrieval_method', 'bm25_tokenizer', 'vectordb_name']:
@@ -344,28 +487,57 @@ class SMACRAGOptimizer:
             trial_config = self.config_generator.generate_trial_config(config_dict)
             self._save_trial_config(trial_dir, trial_config)
             
-            results = self.runner.run_pipeline(config_dict, trial_dir, sampled_qa_data)
-            score = results.get('combined_score', 0.0)
-            latency = time.time() - trial_start_time
-            
-            trial_result = self._create_trial_result(
-                config_dict, score, latency, budget, budget_percentage, results
-            )
-            self.all_trials.append(trial_result)
+            try:
+                results = self.runner.run_pipeline(config_dict, trial_dir, sampled_qa_data)
+                score = results.get('combined_score', 0.0)
+                latency = time.time() - trial_start_time
+                
+                trial_result = self._create_trial_result(
+                    config_dict, score, latency, budget, budget_percentage, results
+                )
+                trial_result['early_stopped'] = False
+                self.all_trials.append(trial_result)
+                
+            except EarlyStoppingException as e:
+                print(f"\n[TRIAL] Early stopped at {e.component} with score {e.score:.4f}")
+                
+                actual_score = e.score
+                latency = time.time() - trial_start_time
+                
+                trial_result = self._create_trial_result(
+                    config_dict, actual_score, latency, budget, budget_percentage, 
+                    {
+                        'early_stopped': True, 
+                        'stopped_at': e.component, 
+                        'stopped_score': e.score,
+                        'combined_score': actual_score,
+                        f'{e.component}_score': e.score,
+                        'incomplete_pipeline': True
+                    }
+                )
+                trial_result['early_stopped'] = True
+                trial_result['stopped_at'] = e.component
+                trial_result['stopped_score'] = e.score
+                trial_result['actual_score'] = actual_score
+                
+                self.all_trials.append(trial_result)
+                self.early_stopped_trials.append(trial_result)
             
             self._save_trial_results(trial_dir, trial_result)
-            self._print_trial_summary(score, latency, budget, budget_percentage)
+            self._print_trial_summary(actual_score if 'actual_score' in locals() else score, 
+                                    latency, budget, budget_percentage, trial_result)
             
             if self.use_wandb:
                 self._log_trial_to_wandb(config_dict, trial_result)
             
-            return {"score": -score, "latency": latency}
+            return {"score": -(actual_score if 'actual_score' in locals() else score), "latency": latency}
             
         except Exception as e:
             print(f"Error in trial {self.trial_counter}: {e}")
             import traceback
             traceback.print_exc()
             return {"score": 0.0, "latency": float('inf')}
+    
     
     def _setup_trial_directory(self, budget: int) -> str:
         trial_dir = os.path.join(self.result_dir, f"trial_{self.trial_counter}_budget_{budget}")
@@ -418,6 +590,37 @@ class SMACRAGOptimizer:
     def _prepare_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         config_dict = config if isinstance(config, dict) else dict(config)
 
+        if 'reranker_config' in config_dict:
+
+            reranker_config_str = config_dict['reranker_config']
+            
+            if reranker_config_str == 'pass_reranker':
+                config_dict['passage_reranker_method'] = 'pass_reranker'
+            elif reranker_config_str == 'sap_api':
+                config_dict['passage_reranker_method'] = 'sap_api'
+                unified_params = self.config_generator.extract_unified_parameters('passage_reranker')
+                models = unified_params.get('models', {})
+                api_endpoints = unified_params.get('api_endpoints', {})
+                
+                if 'sap_api' in models and models['sap_api']:
+                    config_dict['reranker_model_name'] = models['sap_api'][0]
+                else:
+                    config_dict['reranker_model_name'] = 'cohere-rerank-v3.5'
+                    
+                if 'sap_api' in api_endpoints:
+                    config_dict['reranker_api_url'] = api_endpoints['sap_api']
+            else:
+                parts = reranker_config_str.split('::', 1)
+                if len(parts) == 2:
+                    method, model = parts
+                    config_dict['passage_reranker_method'] = method
+                    config_dict['reranker_model_name'] = model
+                else:
+                    config_dict['passage_reranker_method'] = reranker_config_str
+
+
+            del config_dict['reranker_config']
+
         if 'query_expansion_method' not in config_dict:
             if 'retrieval_method' not in config_dict:
                 retrieval_options = self.config_generator.extract_retrieval_options()
@@ -434,36 +637,39 @@ class SMACRAGOptimizer:
         config_dict = self.config_space_builder.clean_trial_config(config_dict)
         config_dict = self._convert_numpy_types(config_dict)
 
+        bearer_token_params = [
+            'compressor_bearer_token', 
+            'generator_bearer_token', 
+            'query_expansion_bearer_token'
+        ]
+        for param in bearer_token_params:
+            if param in config_dict:
+                del config_dict[param]
+
+        if config_dict.get('passage_compressor_method') in ['refine', 'tree_summarize']:
+            if 'compressor_temperature' in config_dict:
+                del config_dict['compressor_temperature']
+            if 'compressor_max_tokens' in config_dict:
+                del config_dict['compressor_max_tokens']
+                
+        if config_dict.get('passage_compressor_method') not in ['lexrank', 'spacy']:
+            config_dict.pop('compression_ratio', None)
+            config_dict.pop('compressor_compression_ratio', None)
+
         for temp_param in ['generator_temperature', 'query_expansion_temperature', 'temperature']:
             if temp_param in config_dict:
                 try:
                     config_dict[temp_param] = float(config_dict[temp_param])
                 except:
                     config_dict[temp_param] = 0.7
-        
+                    
         config_dict = self._validate_topk_constraints(config_dict)
         
         return config_dict
     
     def _convert_numpy_types(self, obj):
-        if isinstance(obj, pd.DataFrame):
-            return {"type": "DataFrame", "shape": list(obj.shape), "columns": list(obj.columns)}
-        elif isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating): 
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {k: self._convert_numpy_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._convert_numpy_types(i) for i in obj]
-        elif isinstance(obj, tuple):
-            return tuple(self._convert_numpy_types(i) for i in obj)
-        elif hasattr(obj, 'item'): 
-            return obj.item()
-        else:
-            return obj
+        return Utils.convert_numpy_types(obj)
+
     
     def _save_trial_config(self, trial_dir: str, trial_config: Dict[str, Any]):
         config_file = os.path.join(trial_dir, "config.yaml")
@@ -509,11 +715,15 @@ class SMACRAGOptimizer:
         with open(results_file, 'w') as f:
             json.dump(trial_result, f, indent=2)
     
-    def _print_trial_summary(self, score, latency, budget, budget_percentage):
+    def _print_trial_summary(self, score, latency, budget, budget_percentage, trial_result=None):
         print(f"Trial {self.trial_counter} completed:")
         print(f"  Score: {score:.4f}")
         print(f"  Latency: {latency:.2f}s")
         print(f"  Budget: {budget} samples ({budget_percentage:.1%})")
+        
+        if trial_result and trial_result.get('early_stopped', False):
+            print(f"  ⚠️  EARLY STOPPED at {trial_result.get('stopped_at', 'unknown')}")
+            print(f"  ⚠️  Component score: {trial_result.get('stopped_score', 0.0):.4f}")
     
     def _log_trial_to_wandb(self, config_dict, trial_result):
         WandBLogger.log_trial_metrics(
@@ -570,6 +780,7 @@ class SMACRAGOptimizer:
     def _initialize_wandb(self):
         WandBLogger.reset_step_counter()
         
+        search_space_size, combination_note = self._calculate_total_search_space()
         cs = self.config_space_builder.build_configuration_space()
         search_space_info = self.config_space_builder.get_search_space_info()
         
@@ -578,7 +789,9 @@ class SMACRAGOptimizer:
             "n_trials": self.n_trials,
             "retrieval_weight": self.retrieval_weight,
             "generation_weight": self.generation_weight,
-            "search_space_size": search_space_info['n_hyperparameters'],
+            "search_space_size": search_space_size,
+            "search_space_note": combination_note,
+            "n_hyperparameters": search_space_info['n_hyperparameters'],
             "study_name": self.study_name,
             "early_stopping_threshold": self.early_stopping_threshold,
             "n_workers": self.n_workers,
@@ -954,6 +1167,17 @@ class SMACRAGOptimizer:
         print(f"{'='*60}")
         print(f"Total optimization time: {time_str}")
         print(f"Total trials: {self.trial_counter}")
+        print(f"Early stopped trials: {len(self.early_stopped_trials)}")
+        
+        if self.early_stopped_trials:
+            print("\nEarly stopping summary:")
+            component_counts = {}
+            for trial in self.early_stopped_trials:
+                component = trial.get('stopped_at', 'unknown')
+                component_counts[component] = component_counts.get(component, 0) + 1
+            
+            for component, count in component_counts.items():
+                print(f"  {component}: {count} trials stopped")
         
         if self.use_multi_fidelity and self.all_trials:
             self._print_multifidelity_summary()
@@ -1000,17 +1224,27 @@ class SMACRAGOptimizer:
         config_str = json.dumps(dict(sorted(config.items())), sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()[:8]
     
-    def _print_initialization_summary(self):    
+    def _print_initialization_summary(self):
+        summary = self._get_search_space_summary()
+        
         print(f"\n===== {self.optimizer.upper()} {'Multi-Fidelity ' if self.use_multi_fidelity else ''}RAG Pipeline Optimizer =====")
         print(f"Using {self.n_trials} trials")
+        print(f"Total search space combinations: {summary['search_space_size']:,}")
+        print(f"Note: {summary.get('combination_note', '')}")
         print(f"Objectives: maximize score (weight={self.generation_weight}), minimize latency (weight={self.retrieval_weight})")
         
         if self.use_multi_fidelity:
             print(f"\nMulti-fidelity settings:")
             print(f"  Min budget: {self.min_budget} samples ({self.min_budget_percentage:.1%})")
             print(f"  Max budget: {self.max_budget} samples ({self.max_budget_percentage:.1%})")
-            print(f"  Eta: {self.eta}")      
-
+            print(f"  Eta: {self.eta}")
+        
+        for component, info in summary.items():
+            if component not in ["search_space_size", "combination_note"] and info['combinations'] > 1:
+                print(f"\n{component.title().replace('_', ' ')}:")
+                print(f"  Combinations: {info['combinations']:,}")
+        
+        print(f"\nCPUs per trial: {self.cpu_per_trial}")
         print(f"Using cached embeddings: {self.use_cached_embeddings}")
         if self.walltime_limit is not None:
             print(f"Wall time limit: {self.walltime_limit}s")

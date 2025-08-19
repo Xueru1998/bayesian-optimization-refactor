@@ -20,12 +20,12 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from optuna_rag.objective import OptunaObjective
 from pipeline.wandb_logger import WandBLogger
-from pipeline.search_space_calculator import SearchSpaceCalculator
+from pipeline.search_space_calculator import CombinationCalculator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -59,7 +59,9 @@ class BOPipelineOptimizer:
         ragas_embedding_model: str = "text-embedding-ada-002",
         ragas_metrics: Optional[Dict[str, List[str]]] = None,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o"
+        llm_evaluator_config: Optional[Dict[str, Any]] = None,
+        disable_early_stopping: bool = False,
+        early_stopping_thresholds: Optional[Dict[str, float]] = None
     ):
         self.start_time = time.time()
         
@@ -73,6 +75,7 @@ class BOPipelineOptimizer:
         
         self.qa_df = qa_df
         self.corpus_df = corpus_df
+        print(f"[DEBUG BOPipelineOptimizer] Has generation_gt: {'generation_gt' in qa_df.columns}")
         
         self.project_dir = Utils.get_centralized_project_dir(project_dir)
         print(f"BO using centralized project directory: {self.project_dir}")
@@ -82,17 +85,21 @@ class BOPipelineOptimizer:
         
         self.config_generator = ConfigGenerator(self.config_template)
         
-        self.search_space_calculator = SearchSpaceCalculator(self.config_generator)
-        
+        self.combination_calculator = CombinationCalculator(
+            self.config_generator,
+            search_type='bo' 
+        )
+
         if n_trials is None:
-            suggestion = self.search_space_calculator.suggest_num_samples(
+            suggestion = self._suggest_num_samples_with_calculator(
                 sample_percentage=sample_percentage,
                 min_samples=10,
                 max_samples=50,
                 max_combinations=500
             )
             self.n_trials = suggestion['num_samples']
-            print(f"Use default trials: {self.n_trials}")
+            print(f"Auto-calculated n_trials: {self.n_trials}")
+            print(f"Reasoning: {suggestion['reasoning']}")
         else:
             self.n_trials = n_trials
             print(f"Using provided n_trials: {self.n_trials}")
@@ -115,7 +122,17 @@ class BOPipelineOptimizer:
         self.ragas_embedding_model = ragas_embedding_model
         
         self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
-        self.llm_evaluator_model = llm_evaluator_model
+        self.llm_evaluator_config = llm_evaluator_config or {}
+
+        self.disable_early_stopping = disable_early_stopping
+        self.early_stopping_thresholds = early_stopping_thresholds or {
+            'retrieval': 0.1,
+            'query_expansion': 0.1,
+            'reranker': 0.2,
+            'filter': 0.25,
+            'compressor': 0.3
+        }
+        self.early_stopped_trials = [] 
         
         if ragas_metrics is None and use_ragas:
             self.ragas_metrics = {
@@ -146,6 +163,171 @@ class BOPipelineOptimizer:
         self.search_space = self.config_extractor.extract_search_space()
         
         self._print_initialization_summary()
+        
+    def _suggest_num_samples_with_calculator(
+        self, 
+        sample_percentage: float = 0.1, 
+        min_samples: int = 10,
+        max_samples: int = 50, 
+        max_combinations: int = 500
+    ) -> Dict[str, Any]:
+        total_combinations = 1
+        combination_note = ""
+        
+        components = [
+            'query_expansion', 'retrieval', 'passage_filter', 
+            'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+        ]
+        
+        for component in components:
+            combos, note = self.combination_calculator.calculate_component_combinations(component)
+            if combos > 0:
+                total_combinations *= combos
+                combination_note = note  
+
+        if total_combinations > max_combinations:
+            import math
+            log_combinations = math.log10(total_combinations)
+            log_max = math.log10(max_combinations)
+            
+            suggested_samples = int(min_samples + (max_samples - min_samples) * min(log_combinations / log_max, 1.0))
+            
+            return {
+                "num_samples": max_samples,
+                "search_space_size": total_combinations,
+                "sample_percentage": max_samples / total_combinations if total_combinations > 0 else 0,
+                "reasoning": f"Large search space detected ({total_combinations:,} combinations), using max samples ({max_samples}) for better coverage. {combination_note}"
+            }
+
+        suggested_samples = max(min_samples, int(total_combinations * sample_percentage))
+        suggested_samples = min(suggested_samples, max_samples)
+        
+        return {
+            "num_samples": suggested_samples,
+            "search_space_size": total_combinations,
+            "sample_percentage": sample_percentage,
+            "reasoning": f"Auto-calculated based on {sample_percentage*100}% of {total_combinations} total combinations. {combination_note}"
+        }
+
+    def _print_initialization_summary(self):
+
+        summary = self._get_search_space_summary_with_calculator()
+        
+        print("\n===== RAG Pipeline Optimizer Initialized =====")
+        print(f"Using {self.n_trials} trials with {self.optimizer.upper()} sampler")
+        print(f"Total search space combinations (estimated): {summary['search_space_size']}")
+        print(f"Note: {summary['combination_note']}")
+        
+        if self.use_ragas:
+            print(f"\nEvaluation Method: RAGAS")
+            print(f"  LLM Model: {self.ragas_llm_model}")
+            print(f"  Embedding Model: {self.ragas_embedding_model}")
+            print(f"  Metrics: {list(self.ragas_metrics.get('retrieval', [])) + list(self.ragas_metrics.get('generation', []))}")
+        else:
+            print(f"\nEvaluation Method: Traditional (component-wise)")
+
+        for component, info in summary.items():
+            if component not in ["search_space_size", "combination_note"] and info['combinations'] > 1:
+                print(f"\n{component.title()}:")
+                print(f"  Combinations (estimated): {info['combinations']}")
+                
+                if component == "retrieval":
+                    print(f"  Metrics: {self.retrieval_metrics}")
+                elif component == "query_expansion" and self.query_expansion_metrics:
+                    print(f"  Metrics: {self.query_expansion_metrics}")
+                elif component == "filter" and self.filter_metrics:
+                    print(f"  Metrics: {self.filter_metrics}")
+                elif component == "reranker" and self.reranker_metrics:
+                    print(f"  Metrics: {self.reranker_metrics}")
+                elif component == "compressor" and self.compressor_metrics:
+                    print(f"  Metrics: {self.compressor_metrics}")
+                elif component == "prompt_maker" and self.prompt_maker_metrics:
+                    print(f"  Metrics: {self.prompt_maker_metrics}")
+                elif component == "generator" and self.generation_metrics:
+                    print(f"  Metrics: {self.generation_metrics}")
+        
+        print(f"\nScore weights - Retrieval: {self.retrieval_weight}, Generation: {self.generation_weight}")
+
+        print("\nSearch space summary:")
+        continuous_params = []
+        categorical_params = []
+        
+        for param, values in self.search_space.items():
+            if isinstance(values, list):
+                categorical_params.append(f"  {param}: {len(values)} options (categorical)")
+            elif isinstance(values, tuple):
+                continuous_params.append(f"  {param}: ({values[0]}, {values[1]}) (continuous)")
+        
+        if categorical_params:
+            print("Categorical parameters:")
+            for param in categorical_params:
+                print(param)
+        
+        if continuous_params:
+            print("Continuous parameters (BO will explore within ranges):")
+            for param in continuous_params:
+                print(param)
+        
+        if not self.disable_early_stopping:
+            print("\nEarly stopping enabled with thresholds:")
+            for component, threshold in self.early_stopping_thresholds.items():
+                print(f"  {component}: < {threshold}")
+        else:
+            print("\nEarly stopping: DISABLED")
+
+    def _get_search_space_summary_with_calculator(self) -> Dict[str, Any]:
+ 
+        components = [
+            'query_expansion', 'retrieval', 'passage_filter',
+            'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+        ]
+        
+        summary = {}
+        total_combinations = 1
+        combination_note = ""
+
+        has_active_qe = False
+        if self.config_generator.node_exists("query_expansion"):
+            qe_config = self.config_generator.extract_node_config("query_expansion")
+            if qe_config and qe_config.get("modules", []):
+                for module in qe_config.get("modules", []):
+                    if module.get("module_type") != "pass_query_expansion":
+                        has_active_qe = True
+                        break
+        
+        for component in components:
+            if component == 'retrieval' and has_active_qe:
+                summary[component] = {
+                    'combinations': 0,
+                    'config': None,
+                    'skipped_when_qe_active': True
+                }
+                continue
+            
+            combos, note = self.combination_calculator.calculate_component_combinations(component)
+            combination_note = note  
+            
+            config = None
+            if component == 'query_expansion':
+                config = self.config_generator.extract_node_config("query_expansion")
+            elif component == 'retrieval':
+                config = self.config_generator.extract_retrieval_options()
+            else:
+                config = self.config_generator.extract_node_config(component.replace('_', '-'))
+            
+            summary[component] = {
+                'combinations': combos,
+                'config': config,
+                'includes_retrieval': (component == 'query_expansion' and has_active_qe)
+            }
+            
+            if combos > 0:
+                total_combinations *= combos
+        
+        summary['search_space_size'] = total_combinations
+        summary['combination_note'] = combination_note
+        
+        return summary
 
     def _initialize_metrics(self):
         self.retrieval_metrics = self.config_generator.extract_retrieval_metrics_from_config()
@@ -175,6 +357,22 @@ class BOPipelineOptimizer:
             self.prompt_maker_metrics = self.config_generator.extract_generation_metrics_from_config(node_type='prompt_maker')
 
     def _initialize_pipeline_runner(self):
+        runner_params = {
+            'config_generator': self.config_generator,
+            'retrieval_metrics': self.retrieval_metrics,
+            'filter_metrics': self.filter_metrics,
+            'compressor_metrics': self.compressor_metrics,
+            'generation_metrics': self.generation_metrics,
+            'prompt_maker_metrics': self.prompt_maker_metrics,
+            'query_expansion_metrics': self.query_expansion_metrics,
+            'reranker_metrics': self.reranker_metrics,
+            'retrieval_weight': self.retrieval_weight,
+            'generation_weight': self.generation_weight,
+            'use_llm_evaluator': self.use_llm_compressor_evaluator,
+            'llm_evaluator_config': self.llm_evaluator_config,
+            'early_stopping_thresholds': self.early_stopping_thresholds if not self.disable_early_stopping else None
+        }
+        
         if self.use_ragas:
             ragas_config = {
                 'llm_model': self.ragas_llm_model,
@@ -182,90 +380,10 @@ class BOPipelineOptimizer:
                 'retrieval_metrics': self.ragas_metrics.get('retrieval', []),
                 'generation_metrics': self.ragas_metrics.get('generation', [])
             }
-            
-            self.pipeline_runner = RAGPipelineRunner(
-                config_generator=self.config_generator,
-                retrieval_metrics=self.retrieval_metrics,
-                filter_metrics=self.filter_metrics,
-                compressor_metrics=self.compressor_metrics,
-                generation_metrics=self.generation_metrics,
-                prompt_maker_metrics=self.prompt_maker_metrics,
-                query_expansion_metrics=self.query_expansion_metrics,
-                reranker_metrics=self.reranker_metrics,
-                retrieval_weight=self.retrieval_weight,
-                generation_weight=self.generation_weight,
-                use_ragas=True,
-                ragas_config=ragas_config,
-                use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-                llm_evaluator_model=self.llm_evaluator_model
-            )
-        else:
-            self.pipeline_runner = RAGPipelineRunner(
-                config_generator=self.config_generator,
-                retrieval_metrics=self.retrieval_metrics,
-                filter_metrics=self.filter_metrics,
-                compressor_metrics=self.compressor_metrics,
-                generation_metrics=self.generation_metrics,
-                prompt_maker_metrics=self.prompt_maker_metrics,
-                query_expansion_metrics=self.query_expansion_metrics,
-                reranker_metrics=self.reranker_metrics,
-                retrieval_weight=self.retrieval_weight,
-                generation_weight=self.generation_weight,
-                use_llm_compressor_evaluator=self.use_llm_compressor_evaluator,
-                llm_evaluator_model=self.llm_evaluator_model
-            )
-
-    def _print_initialization_summary(self):
-        summary = {}
-        components = ['query_expansion', 'retrieval', 'passage_filter', 'passage_reranker', 
-                    'passage_compressor', 'prompt_maker_generator']
+            runner_params['use_ragas'] = True
+            runner_params['ragas_config'] = ragas_config
         
-        for component in components:
-            combinations, note = self.search_space_calculator.calculate_component_combinations(component)
-            summary[component] = {
-                'combinations': combinations,
-                'note': note
-            }
-        
-        total_combinations = self.search_space_calculator.calculate_total_combinations()
-        
-        print("\n===== RAG Pipeline Optimizer Initialized =====")
-        print(f"Using {self.n_trials} trials with {self.optimizer.upper()} sampler")
-        
-        if self.use_ragas:
-            print(f"\nEvaluation Method: RAGAS")
-            print(f"  LLM Model: {self.ragas_llm_model}")
-            print(f"  Embedding Model: {self.ragas_embedding_model}")
-            print(f"  Metrics: {list(self.ragas_metrics.get('retrieval', [])) + list(self.ragas_metrics.get('generation', []))}")
-        else:
-            print(f"\nEvaluation Method: Traditional (component-wise)")
-        
-        for component in components:
-            if summary[component]['combinations'] > 0:
-                print(f"\n{component.replace('_', ' ').title()}:")
-                
-                if component == "retrieval":
-                    print(f"  Metrics: {self.retrieval_metrics}")
-                elif component == "query_expansion" and self.query_expansion_metrics:
-                    print(f"  Metrics: {self.query_expansion_metrics}")
-                elif component == "passage_filter" and self.filter_metrics:
-                    print(f"  Metrics: {self.filter_metrics}")
-                elif component == "passage_reranker" and self.reranker_metrics:
-                    print(f"  Metrics: {self.reranker_metrics}")
-                elif component == "passage_compressor" and self.compressor_metrics:
-                    print(f"  Metrics: {self.compressor_metrics}")
-                elif component == "prompt_maker_generator":
-                    if self.generation_metrics:
-                        print(f"  Generator Metrics: {self.generation_metrics}")
-                        
-        print(f"\nScore weights - Retrieval: {self.retrieval_weight}, Generation: {self.generation_weight}")
-        
-        print("\nSearch space summary:")
-        for param, values in self.search_space.items():
-            if isinstance(values, list):
-                print(f"  {param}: {len(values)} options (categorical)")
-            elif isinstance(values, tuple):
-                print(f"  {param}: ({values[0]}, {values[1]}) (continuous)")
+        self.pipeline_runner = RAGPipelineRunner(**runner_params)
 
     def objective(self, trial: optuna.Trial) -> Tuple[float, float]:
         start_time = time.time()
@@ -292,6 +410,8 @@ class BOPipelineOptimizer:
             latency = execution_time
 
             display_config = {k: v for k, v in trial.params.items()}
+            
+            display_config['save_intermediate_results'] = True
 
             if self.use_ragas and 'ragas_mean_score' in trial.user_attrs:
                 ragas_score = trial.user_attrs.get('ragas_mean_score', 0.0)
@@ -313,6 +433,18 @@ class BOPipelineOptimizer:
             trial_result = self._create_trial_result(
                 trial.number, display_config, score, latency, trial.user_attrs
             )
+
+            trial_dir = os.path.join(self.result_dir, f"trial_{trial.number}")
+            if os.path.exists(trial_dir):
+                debug_dir = os.path.join(trial_dir, "debug_intermediate_results")
+                if os.path.exists(debug_dir):
+                    print(f"[DEBUG] Intermediate results saved in: {debug_dir}")
+                    parquet_files = [f for f in os.listdir(debug_dir) if f.endswith('.parquet')]
+                    json_files = [f for f in os.listdir(debug_dir) if f.endswith('.json')]
+                    print(f"[DEBUG] Found {len(parquet_files)} parquet files and {len(json_files)} JSON files")
+                    for pf in parquet_files:
+                        file_size = os.path.getsize(os.path.join(debug_dir, pf)) / 1024
+                        print(f"[DEBUG]   - {pf} ({file_size:.1f} KB)")
 
             if self.use_wandb:
                 WandBLogger.log_trial_metrics(trial, score, results=trial_result)
@@ -377,6 +509,44 @@ class BOPipelineOptimizer:
                 print(f"  Generator Score: {gen_score:.4f}")
 
             return -score, latency
+            
+        except EarlyStoppingException as e:
+            # NEW: Handle early stopping for low-scoring components
+            print(f"\n[TRIAL {trial.number}] Early stopped at {e.component} with score {e.score:.4f}")
+            
+            execution_time = time.time() - start_time
+            trial.set_user_attr('execution_time', execution_time)
+            trial.set_user_attr('early_stopped', True)
+            trial.set_user_attr('stopped_at', e.component)
+            trial.set_user_attr('stopped_score', e.score)
+            
+            actual_score = e.score
+            latency = execution_time
+            
+            display_config = {k: v for k, v in trial.params.items()}
+            display_config['save_intermediate_results'] = True
+            
+            trial_result = self._create_trial_result(
+                trial.number, display_config, actual_score, latency, trial.user_attrs
+            )
+            trial_result['early_stopped'] = True
+            trial_result['stopped_at'] = e.component
+            trial_result['stopped_score'] = e.score
+            
+            self.all_trials.append(trial_result)
+            self.early_stopped_trials.append(trial_result) 
+            
+            if self.use_wandb:
+                WandBLogger.log_trial_metrics(trial, actual_score, results=trial_result)
+                wandb.log({
+                    "early_stopped": True,
+                    "stopped_at": e.component,
+                    "stopped_score": e.score
+                }, step=trial.number)
+            
+            print(f"  ⚠️  EARLY STOPPED - Component: {e.component}, Score: {e.score:.4f}")
+            
+            return -actual_score, latency
             
         except Exception as e:
             print(f"Error in trial {trial.number}: {e}")
@@ -528,11 +698,46 @@ class BOPipelineOptimizer:
             return max(pareto_front, key=lambda x: x['score'])
         
         return None
-
+    
+    def _calculate_total_search_space(self) -> Tuple[int, str]:
+        total_combinations = 1
+        combination_note = ""
+        
+        components = [
+            'query_expansion', 'retrieval', 'passage_filter', 
+            'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+        ]
+        
+        has_active_qe = False
+        if self.config_generator.node_exists("query_expansion"):
+            qe_config = self.config_generator.extract_node_config("query_expansion")
+            if qe_config and qe_config.get("modules", []):
+                for module in qe_config.get("modules", []):
+                    if module.get("module_type") != "pass_query_expansion":
+                        has_active_qe = True
+                        break
+        
+        for component in components:
+            if component == 'retrieval' and has_active_qe:
+                continue
+            
+            combos, note = self.combination_calculator.calculate_component_combinations(
+                component, 
+                search_space=self.search_space
+            )
+            
+            if combos > 0:
+                total_combinations *= combos
+                combination_note = note
+        
+        return total_combinations, combination_note
+    
     def optimize(self) -> Dict[str, Any]:
         start_time = time.time()
         
         if self.use_wandb:
+            search_space_size, combination_note = self._calculate_total_search_space()
+            
             search_space_filtered = {}
             for param_name, param_value in self.search_space.items():
                 if isinstance(param_value, list):
@@ -549,7 +754,8 @@ class BOPipelineOptimizer:
                 "retrieval_weight": self.retrieval_weight,
                 "generation_weight": self.generation_weight,
                 "search_space": search_space_filtered,
-                "search_space_size": self.search_space_calculator.calculate_total_combinations(),
+                "search_space_size": search_space_size,
+                "search_space_note": combination_note,  
                 "study_name": self.study_name,
                 "evaluation_method": "RAGAS" if self.use_ragas else "Traditional",
                 "ragas_enabled": self.use_ragas,
@@ -592,8 +798,7 @@ class BOPipelineOptimizer:
                     n_ei_candidates=24,
                     seed=42,
                     multivariate=True,
-                    constant_liar=True,
-                    warn_independent_sampling=False
+                    constant_liar=True
                 )
                 print("Using TPE (Tree-structured Parzen Estimator) sampler")
                 
@@ -617,8 +822,7 @@ class BOPipelineOptimizer:
                     n_ei_candidates=24,
                     seed=42,
                     multivariate=True,
-                    constant_liar=True,
-                    warn_independent_sampling=False
+                    constant_liar=True
                 )
                 print(f"Unknown sampler type '{self.optimizer}', using TPE as default")
             
@@ -667,6 +871,19 @@ class BOPipelineOptimizer:
             print(f"Total optimization time: {time_str}")
             print(f"Total trials: {len(self.all_trials)}")
             print(f"Sampler used: {self.optimizer.upper()}")
+            
+            print(f"Early stopped trials: {len(self.early_stopped_trials)}")
+
+            if self.early_stopped_trials:
+                print("\nEarly stopping summary:")
+                component_counts = {}
+                for trial in self.early_stopped_trials:
+                    component = trial.get('stopped_at', 'unknown')
+                    component_counts[component] = component_counts.get(component, 0) + 1
+                
+                for component, count in component_counts.items():
+                    print(f"  {component}: {count} trials stopped")
+ 
             
             if best_config:
                 print("\nBest configuration (considering score > 0.9 with minimum latency):")

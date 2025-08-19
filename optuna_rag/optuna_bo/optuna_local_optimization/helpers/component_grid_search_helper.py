@@ -4,6 +4,7 @@ import time
 from typing import Dict, Any, List, Union, Tuple, Set
 import hashlib
 import json
+from pipeline.search_space_calculator import CombinationCalculator
 
 
 class ComponentGridSearchHelper:
@@ -12,13 +13,20 @@ class ComponentGridSearchHelper:
         self.current_combinations = []
         self.current_index = 0
         self.explored_configs = set()
+        self.combination_calculator = None
+        
+    def initialize_calculator(self, config_generator):
+        
+        self.combination_calculator = CombinationCalculator(
+            config_generator, 
+            search_type='grid'
+        )
     
     @staticmethod
     def config_to_hash(config: Dict[str, Any]) -> str:
         sorted_config = dict(sorted(config.items()))
         config_str = json.dumps(sorted_config, sort_keys=True)
-        return hashlib.md5(config_str.encode()).hexdigest()
-    
+        return hashlib.md5(config_str.encode()).hexdigest()    
     
     def get_next_config(self) -> Dict[str, Any]:
         if self.current_index < len(self.current_combinations):
@@ -39,7 +47,6 @@ class ComponentGridSearchHelper:
     
     @staticmethod
     def convert_to_grid_search_space(search_space: Dict[str, Any], range_params: List[str] = None) -> Dict[str, List[Any]]:
-        # Only expand top_k parameters, keep everything else as-is for grid search
         if range_params is None:
             range_params = ['retriever_top_k', 'reranker_top_k']
         
@@ -47,14 +54,11 @@ class ComponentGridSearchHelper:
         
         for param_name, param_spec in search_space.items():
             if isinstance(param_spec, list):
-                # Only expand ranges for top_k parameters
-                should_expand = any(rp in param_name for rp in range_params)
-                
-                if (should_expand and 
-                    len(param_spec) == 2 and 
+                if (len(param_spec) == 2 and 
                     all(isinstance(x, int) for x in param_spec) and
-                    param_spec[1] > param_spec[0]):
-                    min_val, max_val = min(param_spec), max(param_spec)
+                    param_spec[1] > param_spec[0] and
+                    any(rp in param_name for rp in range_params)):
+                    min_val, max_val = param_spec[0], param_spec[1]
                     grid_space[param_name] = list(range(min_val, max_val + 1))
                 else:
                     grid_space[param_name] = param_spec
@@ -63,12 +67,44 @@ class ComponentGridSearchHelper:
                 if isinstance(min_val, int) and any(rp in param_name for rp in range_params):
                     grid_space[param_name] = list(range(min_val, max_val + 1))
                 else:
-                    # For grid search, just use the two boundary values
                     grid_space[param_name] = [min_val, max_val]
             else:
                 grid_space[param_name] = [param_spec]
         
         return grid_space
+    
+    def calculate_total_combinations(self, max_combinations: int = 10000) -> int:
+        try:
+            total_combinations = 1
+            components = [
+                'query_expansion', 'retrieval', 'passage_filter', 
+                'passage_reranker', 'passage_compressor', 'prompt_maker_generator'
+            ]
+            
+            print(f"\nDetailed combination breakdown:")
+            
+            for component in components:
+                combinations, note = self.combination_calculator.calculate_component_combinations(
+                    component
+                )
+                
+                if component == 'retrieval' and combinations == 0:
+                    print(f"  {component}: skipped (active query expansion)")
+                else:
+                    print(f"  {component}: {combinations} combinations")
+                    if combinations > 0:
+                        total_combinations *= combinations
+            
+            print(f"  Total combinations: {total_combinations}")
+            print(f"  Note: {note}")
+            
+            return min(total_combinations, max_combinations)
+            
+        except Exception as e:
+            print(f"Error calculating total combinations: {e}")
+            import traceback
+            traceback.print_exc()
+            return 100
     
     def save_grid_search_sequence(self, component: str, valid_combinations: List[Dict[str, Any]], 
                               output_dir: str) -> None:
@@ -85,7 +121,7 @@ class ComponentGridSearchHelper:
             
             for idx, config in enumerate(valid_combinations, 1):
                 f.write(f"Configuration #{idx:04d}:\n")
-
+   
                 sorted_params = sorted(config.items())
 
                 for param, value in sorted_params:
@@ -109,16 +145,20 @@ class ComponentGridSearchHelper:
         
         print(f"[Grid Search] Saved sequence to: {sequence_file}")
         
-    @staticmethod
-    def calculate_total_combinations(grid_space: Dict[str, List[Any]]) -> int:
-        if not grid_space:
-            return 0
+    def save_all_components_grid_sequence(self, active_components: List[str], result_dir: str, 
+                                     optimizer_instance) -> None:
         
-        total = 1
-        for param_values in grid_space.values():
-            total *= len(param_values)
-        
-        return total
+        for idx, component in enumerate(active_components):
+            component_dir = os.path.join(result_dir, f"{idx}_{component}")
+            os.makedirs(component_dir, exist_ok=True)
+
+            fixed_config = optimizer_instance._get_fixed_config(component, active_components)
+            search_space = optimizer_instance.search_space_builder.build_component_search_space(component, fixed_config)
+            
+            if search_space:
+                valid_combinations = self.get_valid_combinations(component, search_space, fixed_config)
+
+                self.save_grid_search_sequence(component, valid_combinations, component_dir)
     
     @staticmethod
     def _detect_component(search_space: Dict[str, Any]) -> str:
@@ -136,16 +176,175 @@ class ComponentGridSearchHelper:
             return 'prompt_maker_generator'
         return None
     
-    def get_valid_combinations(self, component: str, search_space: Dict[str, Any], fixed_config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        if component == 'passage_compressor' and 'passage_compressor_config' in search_space:
-            configs = search_space['passage_compressor_config']
-            return [{'passage_compressor_config': config} for config in configs]
-        
-        grid_space = ComponentGridSearchHelper.convert_to_grid_search_space(search_space)
-        
+    def get_valid_combinations(self, component: str, search_space: Dict[str, Any], fixed_config: Dict[str, Any] = None) -> List[Dict[str, Any]]:        
         all_combinations = []
+        if component == 'retrieval':
+            grid_space = ComponentGridSearchHelper.convert_to_grid_search_space(search_space)
+            
+            retrieval_methods = grid_space.get('retrieval_method', ['bm25'])
+            top_k_values = grid_space.get('retriever_top_k', [10])
+            bm25_tokenizers = grid_space.get('bm25_tokenizer', ['space'])
+            vectordb_names = grid_space.get('vectordb_name', [])
+            
+            for method in retrieval_methods:
+                for top_k in top_k_values:
+                    if method == 'bm25':
+                        for tokenizer in bm25_tokenizers:
+                            all_combinations.append({
+                                'retrieval_method': method,
+                                'retriever_top_k': top_k,
+                                'bm25_tokenizer': tokenizer
+                            })
+                    elif method == 'vectordb':
+                        for vdb_name in vectordb_names:
+                            all_combinations.append({
+                                'retrieval_method': method,
+                                'retriever_top_k': top_k,
+                                'vectordb_name': vdb_name
+                            })
+            
+            return all_combinations
         
         if component == 'query_expansion':
+            if 'query_expansion_config' in search_space:
+                configs = search_space['query_expansion_config']
+                
+                retriever_top_k_values = search_space.get('retriever_top_k', [10])
+                if isinstance(retriever_top_k_values, list) and len(retriever_top_k_values) == 2:
+                    if all(isinstance(x, int) for x in retriever_top_k_values) and retriever_top_k_values[1] > retriever_top_k_values[0]:
+                        retriever_top_k_values = list(range(retriever_top_k_values[0], retriever_top_k_values[1] + 1))
+                elif not isinstance(retriever_top_k_values, list):
+                    retriever_top_k_values = [retriever_top_k_values]
+                
+                for config in configs:
+                    if config == 'pass_query_expansion':
+                        for top_k in retriever_top_k_values:
+                            if 'retrieval_method' in search_space:
+                                for retrieval_method in search_space['retrieval_method']:
+                                    if retrieval_method == 'bm25' and 'bm25_tokenizer' in search_space:
+                                        for tokenizer in search_space['bm25_tokenizer']:
+                                            all_combinations.append({
+                                                'query_expansion_config': config,
+                                                'retriever_top_k': top_k,
+                                                'retrieval_method': retrieval_method,
+                                                'bm25_tokenizer': tokenizer
+                                            })
+                                    elif retrieval_method == 'vectordb' and 'vectordb_name' in search_space:
+                                        for vdb_name in search_space['vectordb_name']:
+                                            all_combinations.append({
+                                                'query_expansion_config': config,
+                                                'retriever_top_k': top_k,
+                                                'retrieval_method': retrieval_method,
+                                                'vectordb_name': vdb_name
+                                            })
+                            else:
+                                all_combinations.append({
+                                    'query_expansion_config': config,
+                                    'retriever_top_k': top_k
+                                })
+                    else:
+                        parts = config.split('::')
+                        if len(parts) >= 3:
+                            method = parts[0]
+                            base_config = {'query_expansion_config': config}
+                            
+                            if method == 'hyde' and 'query_expansion_max_token' in search_space:
+                                for max_token in search_space['query_expansion_max_token']:
+                                    for top_k in retriever_top_k_values:
+                                        if 'query_expansion_retrieval_method' in search_space:
+                                            for retrieval_method in search_space['query_expansion_retrieval_method']:
+                                                if retrieval_method == 'bm25' and 'query_expansion_bm25_tokenizer' in search_space:
+                                                    for tokenizer in search_space['query_expansion_bm25_tokenizer']:
+                                                        combo = base_config.copy()
+                                                        combo.update({
+                                                            'query_expansion_max_token': max_token,
+                                                            'retriever_top_k': top_k,
+                                                            'query_expansion_retrieval_method': retrieval_method,
+                                                            'query_expansion_bm25_tokenizer': tokenizer
+                                                        })
+                                                        all_combinations.append(combo)
+                                                elif retrieval_method == 'vectordb' and 'query_expansion_vectordb_name' in search_space:
+                                                    for vdb_name in search_space['query_expansion_vectordb_name']:
+                                                        combo = base_config.copy()
+                                                        combo.update({
+                                                            'query_expansion_max_token': max_token,
+                                                            'retriever_top_k': top_k,
+                                                            'query_expansion_retrieval_method': retrieval_method,
+                                                            'query_expansion_vectordb_name': vdb_name
+                                                        })
+                                                        all_combinations.append(combo)
+                                        else:
+                                            combo = base_config.copy()
+                                            combo.update({
+                                                'query_expansion_max_token': max_token,
+                                                'retriever_top_k': top_k
+                                            })
+                                            all_combinations.append(combo)
+                            
+                            elif method == 'query_decompose':
+                                for top_k in retriever_top_k_values:
+                                    if 'query_expansion_retrieval_method' in search_space:
+                                        for retrieval_method in search_space['query_expansion_retrieval_method']:
+                                            if retrieval_method == 'bm25' and 'query_expansion_bm25_tokenizer' in search_space:
+                                                for tokenizer in search_space['query_expansion_bm25_tokenizer']:
+                                                    combo = base_config.copy()
+                                                    combo.update({
+                                                        'retriever_top_k': top_k,
+                                                        'query_expansion_retrieval_method': retrieval_method,
+                                                        'query_expansion_bm25_tokenizer': tokenizer
+                                                    })
+                                                    all_combinations.append(combo)
+                                            elif retrieval_method == 'vectordb' and 'query_expansion_vectordb_name' in search_space:
+                                                for vdb_name in search_space['query_expansion_vectordb_name']:
+                                                    combo = base_config.copy()
+                                                    combo.update({
+                                                        'retriever_top_k': top_k,
+                                                        'query_expansion_retrieval_method': retrieval_method,
+                                                        'query_expansion_vectordb_name': vdb_name
+                                                    })
+                                                    all_combinations.append(combo)
+                                    else:
+                                        combo = base_config.copy()
+                                        combo['retriever_top_k'] = top_k
+                                        all_combinations.append(combo)
+                            
+                            elif method == 'multi_query_expansion' and 'query_expansion_temperature' in search_space:
+                                for temperature in search_space['query_expansion_temperature']:
+                                    for top_k in retriever_top_k_values:
+                                        if 'query_expansion_retrieval_method' in search_space:
+                                            for retrieval_method in search_space['query_expansion_retrieval_method']:
+                                                if retrieval_method == 'bm25' and 'query_expansion_bm25_tokenizer' in search_space:
+                                                    for tokenizer in search_space['query_expansion_bm25_tokenizer']:
+                                                        combo = base_config.copy()
+                                                        combo.update({
+                                                            'query_expansion_temperature': temperature,
+                                                            'retriever_top_k': top_k,
+                                                            'query_expansion_retrieval_method': retrieval_method,
+                                                            'query_expansion_bm25_tokenizer': tokenizer
+                                                        })
+                                                        all_combinations.append(combo)
+                                                elif retrieval_method == 'vectordb' and 'query_expansion_vectordb_name' in search_space:
+                                                    for vdb_name in search_space['query_expansion_vectordb_name']:
+                                                        combo = base_config.copy()
+                                                        combo.update({
+                                                            'query_expansion_temperature': temperature,
+                                                            'retriever_top_k': top_k,
+                                                            'query_expansion_retrieval_method': retrieval_method,
+                                                            'query_expansion_vectordb_name': vdb_name
+                                                        })
+                                                        all_combinations.append(combo)
+                                        else:
+                                            combo = base_config.copy()
+                                            combo.update({
+                                                'query_expansion_temperature': temperature,
+                                                'retriever_top_k': top_k
+                                            })
+                                            all_combinations.append(combo)
+                
+                return all_combinations
+
+            grid_space = ComponentGridSearchHelper.convert_to_grid_search_space(search_space)
+            
             methods = grid_space.get('query_expansion_method', ['pass_query_expansion'])
             top_k_values = grid_space.get('retriever_top_k', [10])
             retrieval_methods = grid_space.get('retrieval_method', ['bm25'])
@@ -301,7 +500,7 @@ class ComponentGridSearchHelper:
             return all_combinations
         
         elif component == 'passage_filter':
-            methods = grid_space.get('passage_filter_method', [])
+            methods = search_space.get('passage_filter_method', [])
             
             for method in methods:
                 if method == 'pass_passage_filter':
@@ -309,61 +508,45 @@ class ComponentGridSearchHelper:
                 elif method == 'threshold_cutoff':
                     param_key = 'threshold_cutoff_threshold'
                     thresholds = search_space.get(param_key, [])
-                    if isinstance(thresholds, tuple):
-                        thresholds = [thresholds[0], thresholds[1]]
-                    elif not isinstance(thresholds, list):
-                        thresholds = [thresholds]
-                    
-                    for threshold in thresholds:
-                        all_combinations.append({
-                            'passage_filter_method': method,
-                            param_key: threshold
-                        })
+                    if isinstance(thresholds, list):
+                        for threshold in thresholds:
+                            all_combinations.append({
+                                'passage_filter_method': method,
+                                param_key: threshold
+                            })
                 elif method == 'percentile_cutoff':
                     param_key = 'percentile_cutoff_percentile'
                     percentiles = search_space.get(param_key, [])
-                    if isinstance(percentiles, tuple):
-                        percentiles = [percentiles[0], percentiles[1]]
-                    elif not isinstance(percentiles, list):
-                        percentiles = [percentiles]
-                    
-                    for percentile in percentiles:
-                        all_combinations.append({
-                            'passage_filter_method': method,
-                            param_key: percentile
-                        })
+                    if isinstance(percentiles, list):
+                        for percentile in percentiles:
+                            all_combinations.append({
+                                'passage_filter_method': method,
+                                param_key: percentile
+                            })
                 elif method == 'similarity_threshold_cutoff':
                     param_key = 'similarity_threshold_cutoff_threshold'
                     thresholds = search_space.get(param_key, [])
-                    if isinstance(thresholds, tuple):
-                        thresholds = [thresholds[0], thresholds[1]]
-                    elif not isinstance(thresholds, list):
-                        thresholds = [thresholds]
-                    
-                    for threshold in thresholds:
-                        all_combinations.append({
-                            'passage_filter_method': method,
-                            param_key: threshold
-                        })
+                    if isinstance(thresholds, list):
+                        for threshold in thresholds:
+                            all_combinations.append({
+                                'passage_filter_method': method,
+                                param_key: threshold
+                            })
                 elif method == 'similarity_percentile_cutoff':
                     param_key = 'similarity_percentile_cutoff_percentile'
                     percentiles = search_space.get(param_key, [])
-                    if isinstance(percentiles, tuple):
-                        percentiles = [percentiles[0], percentiles[1]]
-                    elif not isinstance(percentiles, list):
-                        percentiles = [percentiles]
-                    
-                    for percentile in percentiles:
-                        all_combinations.append({
-                            'passage_filter_method': method,
-                            param_key: percentile
-                        })
+                    if isinstance(percentiles, list):
+                        for percentile in percentiles:
+                            all_combinations.append({
+                                'passage_filter_method': method,
+                                param_key: percentile
+                            })
             
             return all_combinations
         
         elif component == 'passage_reranker':
-            methods = grid_space.get('passage_reranker_method', [])
-            top_k_values = grid_space.get('reranker_top_k', [])
+            methods = search_space.get('passage_reranker_method', [])
+            top_k_values = search_space.get('reranker_top_k', [])
             
             if fixed_config and 'retriever_top_k' in fixed_config:
                 retriever_top_k = fixed_config['retriever_top_k']
@@ -400,122 +583,82 @@ class ComponentGridSearchHelper:
             
             return all_combinations
         
+        if component == 'passage_compressor' and 'passage_compressor_config' in search_space:
+            configs = search_space['passage_compressor_config']
+            all_combinations = []
+            
+            for config in configs:
+                if config == 'pass_compressor':
+                    all_combinations.append({'passage_compressor_config': config})
+                elif config == 'lexrank':
+                    thresholds = search_space.get('lexrank_threshold', [0.05, 0.3])
+                    dampings = search_space.get('lexrank_damping', [0.75, 0.9])
+                    max_iters = search_space.get('lexrank_max_iterations', [15, 40])
+                    comp_ratios = search_space.get('lexrank_compression_ratio', [0.3, 0.7])
+                    
+                    for threshold in thresholds:
+                        for damping in dampings:
+                            for max_iter in max_iters:
+                                for comp_ratio in comp_ratios:
+                                    all_combinations.append({
+                                        'passage_compressor_config': config,
+                                        'lexrank_threshold': threshold,
+                                        'lexrank_damping': damping,
+                                        'lexrank_max_iterations': max_iter,
+                                        'lexrank_compression_ratio': comp_ratio
+                                    })
+                elif config.startswith('spacy::'):
+                    comp_ratios = search_space.get('spacy_compression_ratio', [0.3, 0.5])
+                    spacy_model = config.split('::')[1] if '::' in config else 'en_core_web_sm'
+                    
+                    for comp_ratio in comp_ratios:
+                        all_combinations.append({
+                            'passage_compressor_config': config,
+                            'spacy_compression_ratio': comp_ratio,
+                            'spacy_spacy_model': spacy_model
+                        })
+                else:
+                    all_combinations.append({'passage_compressor_config': config})
+            
+            return all_combinations
+        elif component == 'prompt_maker_generator':
+            all_combinations = []
+            
+            prompt_methods = search_space.get('prompt_maker_method', ['fstring'])
+            prompt_indices = search_space.get('prompt_template_idx', [0])
+            generator_configs = search_space.get('generator_config', [])
+            temperatures = search_space.get('generator_temperature', [])
+            
+            for method in prompt_methods:
+                for prompt_idx in prompt_indices:
+                    for gen_config in generator_configs:
+                        for temp in temperatures:
+                            all_combinations.append({
+                                'prompt_maker_method': method,
+                                'prompt_template_idx': prompt_idx,
+                                'generator_config': gen_config,
+                                'generator_temperature': temp
+                            })
+            
+            return all_combinations
+        
         else:
+            grid_space = ComponentGridSearchHelper.convert_to_grid_search_space(search_space)
+            
             if not grid_space:
                 return [{}]
             
-            if component == 'prompt_maker_generator':
-                prompt_methods = grid_space.get('prompt_maker_method', [])
-                prompt_templates = grid_space.get('prompt_template_idx', [])
-                
-                if isinstance(search_space.get('prompt_template_idx'), tuple):
-                    min_idx, max_idx = search_space['prompt_template_idx']
-                    prompt_templates = list(range(min_idx, max_idx + 1))
-                
-                generator_models = grid_space.get('generator_model', [])
-                generator_temps = grid_space.get('generator_temperature', [])
-                
-                if isinstance(search_space.get('generator_temperature'), tuple):
-                    generator_temps = []
-
-                for method in prompt_methods:
-                    for template_idx in prompt_templates:
-                        for model in generator_models:
-                            if generator_temps:
-                                for temp in generator_temps:
-                                    all_combinations.append({
-                                        'prompt_maker_method': method,
-                                        'prompt_template_idx': template_idx,
-                                        'generator_model': model,
-                                        'generator_temperature': temp
-                                    })
-                            else:
-                                all_combinations.append({
-                                    'prompt_maker_method': method,
-                                    'prompt_template_idx': template_idx,
-                                    'generator_model': model
-                                })
-                
-                return all_combinations
+            keys = list(grid_space.keys())
+            values = [grid_space[key] for key in keys]
             
-            elif component == 'passage_compressor':
-                all_combinations = []
+            all_combinations = []
+            for combo in itertools.product(*values):
+                combination = dict(zip(keys, combo))
                 
-                methods = search_space.get('passage_compressor_method', [])
-                
-                for method in methods:
-                    if method == 'pass_compressor':
-                        all_combinations.append({'passage_compressor_method': method})
-                    
-                    elif method in ['tree_summarize', 'refine']:
-                        models = search_space.get('compressor_model', ['gpt-3.5-turbo-16k'])
-                        llms = search_space.get('compressor_llm', ['openai'])
-                        
-                        for model in models if isinstance(models, list) else [models]:
-                            for llm in llms if isinstance(llms, list) else [llms]:
-                                all_combinations.append({
-                                    'passage_compressor_method': method,
-                                    'compressor_model': model,
-                                    'compressor_llm': llm,
-                                    'compressor_generator_module_type': 'llama_index_llm'
-                                })
-                    
-                    elif method == 'lexrank':
-                        comp_ratios = search_space.get('compressor_compression_ratio', [0.3, 0.7])
-                        thresholds = search_space.get('compressor_threshold', [0.05, 0.3])
-                        dampings = search_space.get('compressor_damping', [0.75, 0.9])
-                        max_iters = search_space.get('compressor_max_iterations', [15, 40])
-                        
-                        if isinstance(comp_ratios, tuple):
-                            comp_ratios = [comp_ratios[0], comp_ratios[1]]
-                        if isinstance(thresholds, tuple):
-                            thresholds = [thresholds[0], thresholds[1]]
-                        if isinstance(dampings, tuple):
-                            dampings = [dampings[0], dampings[1]]
-                        if isinstance(max_iters, tuple):
-                            max_iters = [max_iters[0], max_iters[1]]
-                        
-                        for cr in comp_ratios:
-                            for th in thresholds:
-                                for dp in dampings:
-                                    for mi in max_iters:
-                                        all_combinations.append({
-                                            'passage_compressor_method': method,
-                                            'compressor_compression_ratio': cr,
-                                            'compressor_threshold': th,
-                                            'compressor_damping': dp,
-                                            'compressor_max_iterations': mi
-                                        })
-                    
-                    elif method == 'spacy':
-                        comp_ratios = search_space.get('compressor_compression_ratio', [0.3, 0.5])
-                        spacy_models = search_space.get('compressor_spacy_model', ["en_core_web_sm", "en_core_web_md"])
-                        
-                        if isinstance(comp_ratios, tuple):
-                            comp_ratios = [comp_ratios[0], comp_ratios[1]]
-                        
-                        for cr in comp_ratios:
-                            for sm in spacy_models:
-                                all_combinations.append({
-                                    'passage_compressor_method': method,
-                                    'compressor_compression_ratio': cr,
-                                    'compressor_spacy_model': sm
-                                })
-                
-                return all_combinations
+                if ComponentGridSearchHelper._is_valid_combination(component, combination, fixed_config):
+                    all_combinations.append(combination)
             
-            else:
-                keys = list(grid_space.keys())
-                values = [grid_space[key] for key in keys]
-                
-                all_combinations = []
-                for combo in itertools.product(*values):
-                    combination = dict(zip(keys, combo))
-                    
-                    if ComponentGridSearchHelper._is_valid_combination(component, combination, fixed_config):
-                        all_combinations.append(combination)
-                
-                return all_combinations
+            return all_combinations
     
     @staticmethod
     def _is_valid_combination(component: str, combination: Dict[str, Any], fixed_config: Dict[str, Any] = None) -> bool:

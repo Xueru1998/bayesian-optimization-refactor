@@ -1,47 +1,73 @@
 from typing import Dict, Any, List, Tuple
-from ConfigSpace import ConfigurationSpace, Categorical, Float, Integer, InCondition, EqualsCondition, AndConjunction, ForbiddenEqualsClause, ForbiddenAndConjunction
+from ConfigSpace import ConfigurationSpace, Categorical, Float, Integer, InCondition, EqualsCondition, AndConjunction, Constant, ForbiddenAndConjunction, ForbiddenEqualsClause
 from pipeline.config_manager import ConfigGenerator
-from pipeline.utils import Utils
+from pipeline.search_space_extractor import UnifiedSearchSpaceExtractor, OptimizationType
 import numpy as np
 
 
 class SMACConfigSpaceBuilder:
-    
     def __init__(self, config_generator: ConfigGenerator, seed: int = 42):
         self.config_generator = config_generator
         self.seed = seed
-        self._unified_space = None
-        
-        class UnifiedExtractor:
-            def __init__(self, parent):
-                self.parent = parent
-            
-            def extract_search_space(self, format_type='smac'):
-                return self.parent.get_unified_space()
-        
-        self.unified_extractor = UnifiedExtractor(self)
-        self.query_expansion_retrieval_options = config_generator.extract_query_expansion_retrieval_options()
-    
-    def get_unified_space(self) -> Dict[str, Any]:
-        if self._unified_space is None:
-            self._unified_space = self._extract_all_hyperparameters()
-        return self._unified_space
+        self.unified_extractor = UnifiedSearchSpaceExtractor(config_generator)
+        qe_params = config_generator.extract_unified_parameters('query_expansion')
+        self.query_expansion_retrieval_options = qe_params.get('retrieval_options', {})
     
     def build_configuration_space(self) -> ConfigurationSpace:
         cs = ConfigurationSpace(seed=self.seed)
         
-        unified_space = self.unified_extractor.extract_search_space('smac')
-        
-        for param_name, param_info in unified_space.items():
-            if param_info.get('type') == 'categorical' and 'values' in param_info:
-                original_values = param_info['values']
-                unique_values = list(dict.fromkeys(original_values))
-                if len(unique_values) < len(original_values):
-                    print(f"[WARNING] Removed duplicates from {param_name}: {original_values} -> {unique_values}")
-                    param_info['values'] = unique_values
+        unified_space = self.unified_extractor.extract_search_space(OptimizationType.SMAC)
+
+        added_params = set()
+
+        non_pass_reranker_configs = []
+
+        if 'passage_reranker_method' in unified_space:
+            print(f"\n[ConfigSpaceBuilder DEBUG] Processing passage_reranker_method")
+            unified_params = self.config_generator.extract_unified_parameters('passage_reranker')
+            models_by_method = unified_params.get('models', {})
+            
+            print(f"  Methods found: {list(unified_space['passage_reranker_method']['values'])}")
+            print(f"  Models by method:")
+            for method, models in models_by_method.items():
+                print(f"    {method}: {models}")
+
+            reranker_config_values = []
+            
+            for method in unified_space['passage_reranker_method']['values']:
+                if method == 'pass_reranker':
+                    reranker_config_values.append('pass_reranker')
+                elif method == 'sap_api':
+                    reranker_config_values.append('sap_api')
+                    non_pass_reranker_configs.append('sap_api')
+                elif method in models_by_method and models_by_method[method]:
+                    for model in models_by_method[method]:
+                        config_str = f"{method}::{model}"
+                        reranker_config_values.append(config_str)
+                        non_pass_reranker_configs.append(config_str)
+                    print(f"    Added {len(models_by_method[method])} configs for {method}")
+                else:
+                    reranker_config_values.append(method)
+                    non_pass_reranker_configs.append(method)
+                    print(f"    No models found for {method}, using method name only")
+
+            print(f"\n  Total reranker_config values created: {len(reranker_config_values)}")
+            print(f"  Sample values: {reranker_config_values[:5]}...")
+
+            unified_space['reranker_config'] = {
+                'type': 'categorical',
+                'values': reranker_config_values
+            }
+
+            del unified_space['passage_reranker_method']
+            print(f"  Replaced passage_reranker_method with reranker_config")
+
+            if 'reranker_top_k' in unified_space and unified_space['reranker_top_k'].get('condition'):
+                condition = unified_space['reranker_top_k']['condition']
+                if isinstance(condition, tuple) and condition[0] == 'passage_reranker_method':
+                    unified_space['reranker_top_k']['condition'] = ('reranker_config', 'not_equals', 'pass_reranker')
 
         if 'query_expansion_method' in unified_space:
-
             if 'retrieval_method' in unified_space:
                 unified_space['retrieval_method']['condition'] = ('query_expansion_method', ['pass_query_expansion'])
             
@@ -56,605 +82,127 @@ class SMACConfigSpaceBuilder:
                     ('query_expansion_method', ['pass_query_expansion']),
                     ('retrieval_method', ['vectordb'])
                 ]
-        
-        if 'query_expansion_retrieval_method' in unified_space:
-            pass
-        else:
-            if 'query_expansion_method' in unified_space:
-                qe_retrieval_options = self.query_expansion_retrieval_options
-                if qe_retrieval_options and qe_retrieval_options.get('methods'):
-                    unified_space['query_expansion_retrieval_method'] = {
-                        'type': 'categorical',
-                        'values': qe_retrieval_options['methods'],
-                        'condition': ('query_expansion_method', [m for m in unified_space['query_expansion_method']['values'] if m != 'pass_query_expansion'])
-                    }
-                    
-                    if 'bm25' in qe_retrieval_options['methods'] and qe_retrieval_options.get('bm25_tokenizers'):
-                        unified_space['query_expansion_bm25_tokenizer'] = {
-                            'type': 'categorical',
-                            'values': qe_retrieval_options['bm25_tokenizers'],
-                            'condition': [
-                                ('query_expansion_method', [m for m in unified_space['query_expansion_method']['values'] if m != 'pass_query_expansion']),
-                                ('query_expansion_retrieval_method', ['bm25'])
-                            ]
-                        }
-                    
-                    if 'vectordb' in qe_retrieval_options['methods'] and qe_retrieval_options.get('vectordb_names'):
-                        unified_space['query_expansion_vectordb_name'] = {
-                            'type': 'categorical',
-                            'values': qe_retrieval_options['vectordb_names'],
-                            'condition': [
-                                ('query_expansion_method', [m for m in unified_space['query_expansion_method']['values'] if m != 'pass_query_expansion']),
-                                ('query_expansion_retrieval_method', ['vectordb'])
-                            ]
-                        }
-        
+
+        print(f"\n[ConfigSpaceBuilder DEBUG] Adding parameters to ConfigSpace:")
         for param_name, param_info in unified_space.items():
+            if param_name in added_params:
+                print(f"  Skipping {param_name} - already added")
+                continue
+                
             param = self._create_parameter(param_name, param_info['type'], param_info)
             if param:
                 cs.add(param)
-        
+                added_params.add(param_name)
+                if 'reranker' in param_name:
+                    print(f"  Added {param_name} to ConfigSpace")
+
         self._add_conditions(cs, unified_space)
-        
+
+        if non_pass_reranker_configs and 'reranker_config' in cs and 'reranker_top_k' in cs:
+            cs.add(InCondition(cs['reranker_top_k'], cs['reranker_config'], non_pass_reranker_configs))
+
         if 'retriever_top_k' in cs and 'reranker_top_k' in cs:
             self._add_forbidden_reranker_retriever_relation(cs)
         
-        reranker_top_k_param = None
-        if 'reranker_top_k' in cs:
-            reranker_top_k_param = 'reranker_top_k'
-        elif 'reranker_topk' in cs:
-            reranker_top_k_param = 'reranker_topk'
-        
-        if 'reranker_top_k' in cs and 'passage_filter_method' in cs:
-            filter_methods = [m for m in unified_space.get('passage_filter_method', {}).get('values', []) 
-                            if m != 'pass_passage_filter']
-            
-            # When reranker_top_k=1, forbid all non-pass filter methods
-            for filter_method in filter_methods:
-                cs.add_forbidden_clause(
-                    ForbiddenAndConjunction(
-                        ForbiddenEqualsClause(cs['reranker_top_k'], 1),
-                        ForbiddenEqualsClause(cs['passage_filter_method'], filter_method)
-                    )
-                )
-                    
-                print(f"[DEBUG] Added constraint: {reranker_top_k_param}=1 forces passage_filter_method='pass_passage_filter'")
-        
         return cs
     
-    def _extract_all_hyperparameters(self) -> Dict[str, Any]:
-        params = {}
+    def clean_trial_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned = config.copy()
+
+        composite_params = {
+            'query_expansion_config': self._parse_query_expansion_config,
+            'passage_compressor_config': self._parse_compressor_config,
+            'generator_config': self._parse_generator_config
+        }
         
-        if self.config_generator.node_exists("query_expansion"):
-            params.update(self._extract_query_expansion_params())
-        
-        if self.config_generator.node_exists("retrieval"):
-            params.update(self._extract_retrieval_params())
-        
-        if self.config_generator.node_exists("passage_reranker"):
-            params.update(self._extract_reranker_params())
-        
-        if self.config_generator.node_exists("passage_filter"):
-            params.update(self._extract_filter_params())
-        
-        if self.config_generator.node_exists("passage_compressor"):
-            params.update(self._extract_compressor_params())
-        
-        if self.config_generator.node_exists("prompt_maker"):
-            params.update(self._extract_prompt_maker_params())
-        
-        if self.config_generator.node_exists("generator"):
-            params.update(self._extract_generator_params())
-        
-        return params
-    
-    def _extract_query_expansion_params(self) -> Dict[str, Any]:
-        params = {}
-        qe_config = self.config_generator.extract_node_config("query_expansion")
-        
-        if not qe_config or not qe_config.get("modules"):
-            return params
-        
-        methods = []
-        method_specific_params = {}
-        
-        for module in qe_config.get("modules", []):
-            method = module.get("module_type")
-            if method:
-                methods.append(method)
+        for param_name, parser_func in composite_params.items():
+            if param_name in cleaned:
+                parsed_params = parser_func(cleaned[param_name])
+                cleaned.update(parsed_params)
+                del cleaned[param_name]
+
+        method = cleaned.get('passage_reranker_method')
+        if method and method != 'pass_reranker':
+            model_param = f'reranker_model_{method}'
+            if model_param in cleaned:
+                cleaned['reranker_model_name'] = cleaned[model_param]
+            else:
+                unified_params = self.unified_extractor.extract_search_space(OptimizationType.SMAC)
+                if 'reranker_model_name' in unified_params and 'method_models' in unified_params['reranker_model_name']:
+                    method_models = unified_params['reranker_model_name']['method_models']
+                    if method in method_models and method_models[method]:
+                        cleaned['reranker_model_name'] = method_models[method][0]
+                        print(f"[DEBUG] Added default reranker model for {method}: {cleaned['reranker_model_name']}")
+
+        for key in list(cleaned.keys()):
+            if key.startswith("reranker_model_") and key != "reranker_model_name":
+                del cleaned[key]
+
+        if '_metadata' in cleaned:
+            del cleaned['_metadata']
+            
+        if 'passage_compressor_method' in cleaned:
+            method = cleaned['passage_compressor_method']
+            if method not in ['lexrank', 'spacy']:
+                cleaned.pop('compression_ratio', None)
+                cleaned.pop('compressor_compression_ratio', None)
+
+        if 'query_expansion_method' in cleaned:
+            if cleaned['query_expansion_method'] == 'pass_query_expansion':
+                if 'query_expansion_retrieval_method' in cleaned:
+                    cleaned['retrieval_method'] = cleaned['query_expansion_retrieval_method']
+                    del cleaned['query_expansion_retrieval_method']
                 
-                if method == "query_decompose":
-                    models = module.get("model", [])
-                    if not isinstance(models, list):
-                        models = [models]
+                if cleaned.get('retrieval_method') == 'bm25' and 'query_expansion_bm25_tokenizer' in cleaned:
+                    cleaned['bm25_tokenizer'] = cleaned['query_expansion_bm25_tokenizer']
+                    del cleaned['query_expansion_bm25_tokenizer']
+                elif cleaned.get('retrieval_method') == 'vectordb' and 'query_expansion_vectordb_name' in cleaned:
+                    cleaned['vectordb_name'] = cleaned['query_expansion_vectordb_name']
+                    del cleaned['query_expansion_vectordb_name']
+
+                for param in ['query_expansion_temperature', 'query_expansion_max_token', 
+                            'query_expansion_generator_module_type', 'query_expansion_model',
+                            'query_expansion_llm', 'query_expansion_api_url', 
+                            'query_expansion_bearer_token']:
+                    if param in cleaned:
+                        del cleaned[param]
+            
+            else: 
+                for param in ['retrieval_method', 'bm25_tokenizer', 'vectordb_name']:
+                    if param in cleaned:
+                        del cleaned[param]
+
+                qe_retrieval_options = self.query_expansion_retrieval_options
+
+                if 'query_expansion_retrieval_method' not in cleaned:
+                    if qe_retrieval_options and qe_retrieval_options.get('methods'):
+                        cleaned['query_expansion_retrieval_method'] = qe_retrieval_options['methods'][0]
+                    else:
+                        cleaned['query_expansion_retrieval_method'] = 'bm25'
+                
+                qe_retrieval_method = cleaned.get('query_expansion_retrieval_method')
+                
+                if qe_retrieval_method == 'bm25':
+                    if 'query_expansion_vectordb_name' in cleaned:
+                        del cleaned['query_expansion_vectordb_name']
                     
-                    if models: 
-                        method_specific_params[method] = {}
-                        if models:
-                            method_specific_params[method]["models"] = models
+                    if 'query_expansion_bm25_tokenizer' not in cleaned:
+                        if qe_retrieval_options and qe_retrieval_options.get('bm25_tokenizers'):
+                            cleaned['query_expansion_bm25_tokenizer'] = qe_retrieval_options['bm25_tokenizers'][0]
+                        else:
+                            cleaned['query_expansion_bm25_tokenizer'] = 'space'
                 
-                elif method == "hyde":
-                    models = module.get("model", [])
-                    if not isinstance(models, list):
-                        models = [models]
-                    max_tokens = module.get("max_token", [64])
-                    if not isinstance(max_tokens, list):
-                        max_tokens = [max_tokens]
+                elif qe_retrieval_method == 'vectordb':
+                    if 'query_expansion_bm25_tokenizer' in cleaned:
+                        del cleaned['query_expansion_bm25_tokenizer']
                     
-                    if models: 
-                        method_specific_params[method] = {
-                            "max_tokens": max_tokens
-                        }
-                        if models:
-                            method_specific_params[method]["models"] = models
-                
-                elif method == "multi_query_expansion":
-                    models = module.get("model", [])
-                    if not isinstance(models, list):
-                        models = [models]
-                    temps = module.get("temperature", [0.7])
-                    if not isinstance(temps, list):
-                        temps = [temps]
-                    
-                    method_specific_params[method] = {"temperatures": temps}
-                    if models:
-                        method_specific_params[method]["models"] = models
+                    if 'query_expansion_vectordb_name' not in cleaned:
+                        if qe_retrieval_options and qe_retrieval_options.get('vectordb_names'):
+                            cleaned['query_expansion_vectordb_name'] = qe_retrieval_options['vectordb_names'][0]
+                        else:
+                            cleaned['query_expansion_vectordb_name'] = 'default'
         
-        if methods:
-            params['query_expansion_method'] = {
-                'type': 'categorical',
-                'values': methods
-            }
-            
-            all_models = set()
-            methods_with_model = []
-            
-            for method, method_params in method_specific_params.items():
-                if "models" in method_params:
-                    all_models.update(method_params["models"])
-                    methods_with_model.append(method)
-            
-            if all_models:
-                params['query_expansion_model'] = {
-                    'type': 'categorical',
-                    'values': list(all_models),
-                    'condition': ('query_expansion_method', methods_with_model)
-                }
-            
-            if "hyde" in method_specific_params and "max_tokens" in method_specific_params["hyde"]:
-                params['query_expansion_max_token'] = {
-                    'type': 'categorical',
-                    'values': method_specific_params["hyde"]["max_tokens"],
-                    'condition': ('query_expansion_method', ['hyde'])
-                }
-            
-            if "multi_query_expansion" in method_specific_params and "temperatures" in method_specific_params["multi_query_expansion"]:
-                params['query_expansion_temperature'] = {
-                    'type': 'float',
-                    'values': method_specific_params["multi_query_expansion"]["temperatures"],
-                    'condition': ('query_expansion_method', ['multi_query_expansion'])
-                }
-        
-        qe_retrieval_options = self.config_generator.extract_query_expansion_retrieval_options()
-        if qe_retrieval_options.get('methods'):
-            params['query_expansion_retrieval_method'] = {
-                'type': 'categorical',
-                'values': qe_retrieval_options['methods'],
-                'condition': ('query_expansion_method', [m for m in methods if m != 'pass_query_expansion'])
-            }
-            
-            if 'vectordb' in qe_retrieval_options['methods'] and qe_retrieval_options.get('vectordb_names'):
-                params['query_expansion_vectordb_name'] = {
-                    'type': 'categorical',
-                    'values': qe_retrieval_options['vectordb_names'],
-                    'condition': [
-                        ('query_expansion_method', [m for m in methods if m != 'pass_query_expansion']),
-                        ('query_expansion_retrieval_method', ['vectordb'])
-                    ]
-                }
-        
-        return params
-    
-    def _extract_retrieval_params(self) -> Dict[str, Any]:
-        params = {}
-        retrieval_config = self.config_generator.extract_node_config("retrieval")
-        
-        if not retrieval_config:
-            return params
-        
-        top_k_values = retrieval_config.get('top_k', [5])
-        if isinstance(top_k_values, list) and len(top_k_values) > 0:
-            params['retriever_top_k'] = {
-                'type': 'int' if len(top_k_values) == 2 else 'categorical',
-                'values': top_k_values
-            }
-        
-        methods = []
-        bm25_tokenizers = []
-        vectordb_names = []
-        
-        for module in retrieval_config.get("modules", []):
-            module_type = module.get("module_type")
-            if module_type == "bm25":
-                methods.append("bm25")
-                tokenizers = module.get("bm25_tokenizer", ["porter_stemmer"])
-                if not isinstance(tokenizers, list):
-                    tokenizers = [tokenizers]
-                bm25_tokenizers.extend(tokenizers)
-            elif module_type == "vectordb":
-                methods.append("vectordb")
-                vdbs = module.get("vectordb", ["default"])
-                if not isinstance(vdbs, list):
-                    vdbs = [vdbs]
-                vectordb_names.extend(vdbs)
-        
-        if methods:
-            params['retrieval_method'] = {
-                'type': 'categorical',
-                'values': list(set(methods))
-            }
-        
-        if bm25_tokenizers:
-            params['bm25_tokenizer'] = {
-                'type': 'categorical',
-                'values': list(set(bm25_tokenizers)),
-                'condition': ('retrieval_method', ['bm25'])
-            }
-        
-        if vectordb_names:
-            params['vectordb_name'] = {
-                'type': 'categorical',
-                'values': list(set(vectordb_names)),
-                'condition': ('retrieval_method', ['vectordb'])
-            }
-        
-        return params
-    
-    def _extract_reranker_params(self) -> Dict[str, Any]:
-        params = {}
-        reranker_config = self.config_generator.extract_node_config("passage_reranker")
-        
-        if not reranker_config or not reranker_config.get("modules"):
-            return params
-        
-        methods = []
-        
-        for module in reranker_config.get("modules", []):
-            method = module.get("module_type")
-            if method:
-                methods.append(method)
-        
-        if methods:
-            params['passage_reranker_method'] = {
-                'type': 'categorical',
-                'values': methods
-            }
-
-        top_k_values = reranker_config.get('top_k', [5])
-        if isinstance(top_k_values, list) and len(top_k_values) > 0:
-            non_pass_methods = [m for m in methods if m != 'pass_reranker']
-            if non_pass_methods: 
-                params['reranker_top_k'] = {
-                    'type': 'int' if len(top_k_values) == 2 else 'categorical',
-                    'values': top_k_values,
-                    'condition': ('passage_reranker_method', non_pass_methods)
-                }
-
-        reranker_configs = []
-        for module in reranker_config.get("modules", []):
-            method = module.get("module_type")
-            if method and method != 'pass_reranker':
-                if method in ['colbert_reranker', 'sentence_transformer_reranker', 
-                            'flag_embedding_reranker', 'flag_embedding_llm_reranker',
-                            'openvino_reranker', 'flashrank_reranker', 'monot5']:
-
-                    if 'model_name' in module:
-                        models = module.get("model_name", [])
-                        if not isinstance(models, list):
-                            models = [models]
-                        for model in models:
-                            reranker_configs.append(f"{method}_{model}")
-
-                    elif 'model' in module and method == 'flashrank_reranker':
-                        models = module.get("model", [])
-                        if not isinstance(models, list):
-                            models = [models]
-                        for model in models:
-                            reranker_configs.append(f"{method}_{model}")
-                    else:
-                        reranker_configs.append(method)
-                else:
-                    reranker_configs.append(method)
-        
-        if reranker_configs:
-            params['reranker_config'] = {
-                'type': 'categorical',
-                'values': reranker_configs,
-                'condition': ('passage_reranker_method', [m for m in methods if m != 'pass_reranker'])
-            }
-        
-        return params
-    
-    def _extract_filter_params(self) -> Dict[str, Any]:
-        params = {}
-        filter_config = self.config_generator.extract_node_config("passage_filter")
-        
-        if not filter_config or not filter_config.get("modules"):
-            return params
-        
-        methods = []
-        threshold_values = {}
-        percentile_values = {}
-        
-        for module in filter_config.get("modules", []):
-            method = module.get("module_type")
-            if method:
-                methods.append(method)
-                
-                if method == "threshold_cutoff":
-                    if "threshold" in module:
-                        threshold_values[method] = module["threshold"]
-                elif method == "percentile_cutoff":
-                    if "percentile" in module:
-                        percentile_values[method] = module["percentile"]
-                elif method == "similarity_threshold_cutoff":
-                    if "threshold" in module:
-                        threshold_values[method] = module["threshold"]
-                elif method == "similarity_percentile_cutoff":
-                    if "percentile" in module:
-                        percentile_values[method] = module["percentile"]
-        
-        if methods:
-            params['passage_filter_method'] = {
-                'type': 'categorical',
-                'values': methods
-            }
-        
-        if threshold_values:
-            params['threshold'] = {
-                'type': 'float',
-                'method_values': threshold_values,
-                'condition': ('passage_filter_method', list(threshold_values.keys()))
-            }
-        
-        if percentile_values:
-            params['percentile'] = {
-                'type': 'float',
-                'method_values': percentile_values,
-                'condition': ('passage_filter_method', list(percentile_values.keys()))
-            }
-        
-        return params
-    
-    def _extract_compressor_params(self) -> Dict[str, Any]:
-        params = {}
-        compressor_config = self.config_generator.extract_node_config("passage_compressor")
-        
-        if not compressor_config or not compressor_config.get("modules"):
-            return params
-        
-        methods = []
-        llm_models = {}
-        compression_ratios = {}
-        thresholds = {}
-        dampings = {}
-        max_iterations = {}
-        spacy_models = {}
-        
-        for module in compressor_config.get("modules", []):
-            method = module.get("module_type")
-            if method:
-                methods.append(method)
-                
-                if method in ["tree_summarize", "refine"]:
-                    llm = module.get("llm")
-                    model = module.get("model")
-                    if llm and model:
-                        if method not in llm_models:
-                            llm_models[method] = []
-                        llm_models[method].append(f"{llm}_{model}")
-                
-                elif method == "lexrank":
-                    if "compression_ratio" in module:
-                        compression_ratios[method] = module["compression_ratio"]
-                    if "threshold" in module:
-                        thresholds[method] = module["threshold"]
-                    if "damping" in module:
-                        dampings[method] = module["damping"]
-                    if "max_iterations" in module:
-                        max_iterations[method] = module["max_iterations"]
-                
-                elif method == "spacy":
-                    if "compression_ratio" in module:
-                        compression_ratios[method] = module["compression_ratio"]
-                    if "spacy_model" in module:
-                        spacy_models[method] = module["spacy_model"]
-        
-        if methods:
-            params['passage_compressor_method'] = {
-                'type': 'categorical',
-                'values': methods
-            }
-
-        all_llm_models = []
-        methods_with_llm = []
-        for method, models in llm_models.items():
-            all_llm_models.extend(models)
-            methods_with_llm.append(method)
-        
-        if all_llm_models:
-            params['compressor_llm_model'] = {
-                'type': 'categorical',
-                'values': list(set(all_llm_models)),
-                'condition': ('passage_compressor_method', methods_with_llm)
-            }
-
-        if compression_ratios:
-            all_are_ranges = True
-            all_min_values = []
-            all_max_values = []
-            
-            for method, values in compression_ratios.items():
-                if isinstance(values, list) and len(values) == 2 and all(isinstance(v, (int, float)) for v in values):
-                    all_min_values.append(min(values))
-                    all_max_values.append(max(values))
-                else:
-                    all_are_ranges = False
-                    break
-
-            if all_are_ranges and all_min_values and all_max_values:
-                params['compressor_compression_ratio'] = {
-                    'type': 'float',
-                    'values': [min(all_min_values), max(all_max_values)],
-                    'condition': ('passage_compressor_method', list(compression_ratios.keys()))
-                }
-            else:
-                params['compressor_compression_ratio'] = {
-                    'type': 'float',
-                    'method_values': compression_ratios,
-                    'condition': ('passage_compressor_method', list(compression_ratios.keys()))
-                }
-
-        if thresholds:
-            all_threshold_values = []
-            is_range = False
-            
-            for method, values in thresholds.items():
-                if isinstance(values, list):
-                    if len(values) == 2 and all(isinstance(v, (int, float)) for v in values):
-                        is_range = True
-                        all_threshold_values.extend(values)
-                    else:
-                        all_threshold_values.extend(values)
-                else:
-                    all_threshold_values.append(values)
-            
-            if is_range and len(set(all_threshold_values)) == 2:
-                params['compressor_threshold'] = {
-                    'type': 'float',
-                    'values': [min(all_threshold_values), max(all_threshold_values)],
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-            else:
-                params['compressor_threshold'] = {
-                    'type': 'float',
-                    'method_values': thresholds,
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-
-        if dampings:
-            all_damping_values = []
-            is_range = False
-            
-            for method, values in dampings.items():
-                if isinstance(values, list):
-                    if len(values) == 2 and all(isinstance(v, (int, float)) for v in values):
-                        is_range = True
-                        all_damping_values.extend(values)
-                    else:
-                        all_damping_values.extend(values)
-                else:
-                    all_damping_values.append(values)
-            
-            if is_range and len(set(all_damping_values)) == 2:
-                params['compressor_damping'] = {
-                    'type': 'float',
-                    'values': [min(all_damping_values), max(all_damping_values)],
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-            else:
-                params['compressor_damping'] = {
-                    'type': 'float',
-                    'method_values': dampings,
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-
-        if max_iterations:
-            all_iteration_values = []
-            is_range = False
-            
-            for method, values in max_iterations.items():
-                if isinstance(values, list):
-                    if len(values) == 2 and all(isinstance(v, int) for v in values):
-                        is_range = True
-                        all_iteration_values.extend(values)
-                    else:
-                        all_iteration_values.extend(values)
-                else:
-                    all_iteration_values.append(values)
-            
-            if is_range and len(set(all_iteration_values)) == 2:
-                params['compressor_max_iterations'] = {
-                    'type': 'int',
-                    'values': [min(all_iteration_values), max(all_iteration_values)],
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-            else:
-                params['compressor_max_iterations'] = {
-                    'type': 'int',
-                    'method_values': max_iterations,
-                    'condition': ('passage_compressor_method', ['lexrank'])
-                }
-
-        if spacy_models:
-            all_spacy_models = []
-            for models in spacy_models.values():
-                if isinstance(models, list):
-                    all_spacy_models.extend(models)
-                else:
-                    all_spacy_models.append(models)
-            
-            params['compressor_spacy_model'] = {
-                'type': 'categorical',
-                'values': list(set(all_spacy_models)),
-                'condition': ('passage_compressor_method', ['spacy'])
-            }
-        
-        return params
-        
-    def _extract_prompt_maker_params(self) -> Dict[str, Any]:
-        params = {}
-        prompt_methods, prompt_indices = self.config_generator.extract_prompt_maker_options()
-        
-        if prompt_methods:
-            params['prompt_maker_method'] = {
-                'type': 'categorical',
-                'values': prompt_methods
-            }
-            
-            if prompt_indices:
-                params['prompt_template_idx'] = {
-                    'type': 'categorical',
-                    'values': prompt_indices,
-                    'condition': ('prompt_maker_method', [m for m in prompt_methods if m != 'pass_prompt_maker'])
-                }
-        
-        return params
-    
-    def _extract_generator_params(self) -> Dict[str, Any]:
-        params = {}
-        gen_params = self.config_generator.extract_generator_parameters()
-        
-        if gen_params.get('models'):
-            params['generator_model'] = {
-                'type': 'categorical',
-                'values': gen_params['models']
-            }
-        
-        if gen_params.get('temperatures'):
-            temps = gen_params['temperatures']
-            if len(temps) == 2 and isinstance(temps[0], (int, float)):
-                params['generator_temperature'] = {
-                    'type': 'float',
-                    'values': temps
-                }
-            else:
-                params['generator_temperature'] = {
-                    'type': 'categorical',
-                    'values': temps
-                }
-        
-        return params
+        return cleaned
     
     def _create_parameter(self, name: str, param_type: str, param_info: Dict[str, Any]):
         if param_type == 'categorical':
@@ -685,6 +233,21 @@ class SMACConfigSpaceBuilder:
                     return Categorical(name, values, default=values[0])
         
         return None
+    
+    def _add_forbidden_reranker_retriever_relation(self, cs: ConfigurationSpace):
+        retriever_param = cs['retriever_top_k']
+        reranker_param = cs['reranker_top_k']
+
+        retriever_bounds = retriever_param.lower, retriever_param.upper
+        reranker_bounds = reranker_param.lower, reranker_param.upper
+
+        for retriever_k in range(retriever_bounds[0], retriever_bounds[1] + 1):
+            for reranker_k in range(retriever_k, reranker_bounds[1] + 1):
+                clause = ForbiddenAndConjunction(
+                    ForbiddenEqualsClause(retriever_param, retriever_k),
+                    ForbiddenEqualsClause(reranker_param, reranker_k)
+                )
+                cs.add_forbidden_clause(clause)
     
     def _extract_all_values(self, method_values: Dict[str, Any]) -> List[Any]:
         all_values = []
@@ -732,12 +295,24 @@ class SMACConfigSpaceBuilder:
         if isinstance(condition, list) and len(condition) > 0:
             if isinstance(condition[0], tuple):
                 conjunctions = []
-                for parent_name, parent_values in condition:
-                    if parent_name in cs and isinstance(parent_values, list):
-                        if len(parent_values) == 1:
-                            conjunctions.append(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
-                        else:
-                            conjunctions.append(InCondition(cs[child_name], cs[parent_name], parent_values))
+                for cond_item in condition:
+                    if isinstance(cond_item, tuple) and len(cond_item) == 3:
+                        parent_name, op, parent_values = cond_item
+                        if parent_name in cs:
+                            if op == 'equals':
+                                conjunctions.append(EqualsCondition(cs[child_name], cs[parent_name], parent_values))
+                            elif op == 'in' and isinstance(parent_values, list):
+                                if len(parent_values) == 1:
+                                    conjunctions.append(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
+                                else:
+                                    conjunctions.append(InCondition(cs[child_name], cs[parent_name], parent_values))
+                    elif isinstance(cond_item, tuple) and len(cond_item) == 2:
+                        parent_name, parent_values = cond_item
+                        if parent_name in cs and isinstance(parent_values, list):
+                            if len(parent_values) == 1:
+                                conjunctions.append(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
+                            else:
+                                conjunctions.append(InCondition(cs[child_name], cs[parent_name], parent_values))
                 
                 if len(conjunctions) == 1:
                     cs.add(conjunctions[0])
@@ -751,98 +326,276 @@ class SMACConfigSpaceBuilder:
                     else:
                         cs.add(InCondition(cs[child_name], cs[parent_name], parent_values))
         elif isinstance(condition, tuple):
-            parent_name, parent_values = condition
-            if parent_name in cs and isinstance(parent_values, list):
-                if len(parent_values) == 1:
-                    cs.add(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
-                else:
-                    cs.add(InCondition(cs[child_name], cs[parent_name], parent_values))
-    
-    def _add_forbidden_reranker_retriever_relation(self, cs: ConfigurationSpace):
-        retriever_param = cs['retriever_top_k']
-        reranker_param = cs['reranker_top_k']
-
-        # Forbid reranker_top_k > retriever_top_k
-        retriever_bounds = retriever_param.lower, retriever_param.upper
-        reranker_bounds = reranker_param.lower, reranker_param.upper
-
-        for retriever_k in range(retriever_bounds[0], retriever_bounds[1] + 1):
-            for reranker_k in range(retriever_k, reranker_bounds[1] + 1):
-                clause = ForbiddenAndConjunction(
-                    ForbiddenEqualsClause(retriever_param, retriever_k),
-                    ForbiddenEqualsClause(reranker_param, reranker_k)
-                )
-                cs.add_forbidden_clause(clause)
-    
-    def _parse_reranker_config(self, reranker_config_str: str) -> Dict[str, Any]:
-        if not reranker_config_str:
-            return {}
-
-        simple_methods = ['pass_reranker', 'upr', 'colbert_reranker']
-        if reranker_config_str in simple_methods:
-            return {'passage_reranker_method': reranker_config_str}
-
-        model_based_methods = [
-            'colbert_reranker',
-            'sentence_transformer_reranker',
-            'flag_embedding_reranker',
-            'flag_embedding_llm_reranker',
-            'openvino_reranker',
-            'flashrank_reranker',
-            'monot5'
-        ]
-        
-        for method in model_based_methods:
-            if reranker_config_str.startswith(method + '_'):
-                model_name = reranker_config_str[len(method) + 1:]
-                result = {'passage_reranker_method': method}
-
-                if method == 'flashrank_reranker':
-                    result['reranker_model'] = model_name
-                else:
-                    result['reranker_model_name'] = model_name
-                
-                return result
-
-        return {'passage_reranker_method': reranker_config_str}
+            if len(condition) == 3:
+                parent_name, op, parent_values = condition
+                if parent_name in cs:
+                    if op == 'equals':
+                        cs.add(EqualsCondition(cs[child_name], cs[parent_name], parent_values))
+                    elif op == 'in' and isinstance(parent_values, list):
+                        if len(parent_values) == 1:
+                            cs.add(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
+                        else:
+                            cs.add(InCondition(cs[child_name], cs[parent_name], parent_values))
+            elif len(condition) == 2:
+                parent_name, parent_values = condition
+                if parent_name in cs and isinstance(parent_values, list):
+                    if len(parent_values) == 1:
+                        cs.add(EqualsCondition(cs[child_name], cs[parent_name], parent_values[0]))
+                    else:
+                        cs.add(InCondition(cs[child_name], cs[parent_name], parent_values))
     
     def clean_trial_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = config.copy()
-        
-        # Remove meta parameters that aren't used by the pipeline
-        params_to_remove = [
-            'retrieval_config',
-            'query_expansion_config', 
-            'passage_filter_config',
-            'compressor_config',
-            'prompt_config'
-        ]
-        
-        for param in params_to_remove:
-            cleaned.pop(param, None)
 
-        # Parse composite configurations (data transformation, not constraint)
-        if 'reranker_config' in cleaned:
-            reranker_config_str = cleaned.pop('reranker_config')
-            parsed_config = self._parse_reranker_config(reranker_config_str)
-            cleaned.update(parsed_config)
+        composite_params = {
+            'query_expansion_config': self._parse_query_expansion_config,
+            'passage_compressor_config': self._parse_compressor_config,
+            'generator_config': self._parse_generator_config,
+            'reranker_config': self._parse_reranker_config  
+        }
         
-        # Split composite parameters (data transformation, not constraint)
-        if 'compressor_llm_model' in cleaned:
-            llm_model = cleaned.pop('compressor_llm_model')
-            if '_' in llm_model:
-                llm, model = llm_model.split('_', 1)
-                cleaned['compressor_llm'] = llm
-                cleaned['compressor_model'] = model
-        if 'passage_compressor_method' in cleaned:
-            if cleaned['passage_compressor_method'] not in ['lexrank', 'spacy']:
-                cleaned.pop('compression_ratio', None)
-                cleaned.pop('compressor_compression_ratio', None)
+        for param_name, parser_func in composite_params.items():
+            if param_name in cleaned:
+                parsed_params = parser_func(cleaned[param_name])
+                cleaned.update(parsed_params)
+                del cleaned[param_name]
+
+        if 'reranker_model_name' in cleaned and 'method_models' in cleaned.get('_metadata', {}):
+            method = cleaned.get('passage_reranker_method')
+            if method:
+                model_mappings = cleaned['_metadata']['method_models']
+                if method in model_mappings:
+                    valid_models = model_mappings[method]
+                    if cleaned['reranker_model_name'] not in valid_models:
+                        cleaned['reranker_model_name'] = valid_models[0] if valid_models else cleaned['reranker_model_name']
+
+        if '_metadata' in cleaned:
+            del cleaned['_metadata']
+
+        if 'query_expansion_method' in cleaned:
+            if cleaned['query_expansion_method'] == 'pass_query_expansion':
+                if 'query_expansion_retrieval_method' in cleaned:
+                    cleaned['retrieval_method'] = cleaned['query_expansion_retrieval_method']
+                    del cleaned['query_expansion_retrieval_method']
                 
-                return cleaned
+                if cleaned.get('retrieval_method') == 'bm25' and 'query_expansion_bm25_tokenizer' in cleaned:
+                    cleaned['bm25_tokenizer'] = cleaned['query_expansion_bm25_tokenizer']
+                    del cleaned['query_expansion_bm25_tokenizer']
+                elif cleaned.get('retrieval_method') == 'vectordb' and 'query_expansion_vectordb_name' in cleaned:
+                    cleaned['vectordb_name'] = cleaned['query_expansion_vectordb_name']
+                    del cleaned['query_expansion_vectordb_name']
+
+                for param in ['query_expansion_temperature', 'query_expansion_max_token', 
+                            'query_expansion_generator_module_type', 'query_expansion_model',
+                            'query_expansion_llm', 'query_expansion_api_url', 
+                            'query_expansion_bearer_token']:
+                    if param in cleaned:
+                        del cleaned[param]
+            
+            else: 
+                for param in ['retrieval_method', 'bm25_tokenizer', 'vectordb_name']:
+                    if param in cleaned:
+                        del cleaned[param]
+
+                qe_retrieval_options = self.query_expansion_retrieval_options
+
+                if 'query_expansion_retrieval_method' not in cleaned:
+                    if qe_retrieval_options and qe_retrieval_options.get('methods'):
+                        cleaned['query_expansion_retrieval_method'] = qe_retrieval_options['methods'][0]
+                    else:
+                        cleaned['query_expansion_retrieval_method'] = 'bm25'
+                
+                qe_retrieval_method = cleaned.get('query_expansion_retrieval_method')
+                
+                if qe_retrieval_method == 'bm25':
+                    if 'query_expansion_vectordb_name' in cleaned:
+                        del cleaned['query_expansion_vectordb_name']
+                    
+                    if 'query_expansion_bm25_tokenizer' not in cleaned:
+                        if qe_retrieval_options and qe_retrieval_options.get('bm25_tokenizers'):
+                            cleaned['query_expansion_bm25_tokenizer'] = qe_retrieval_options['bm25_tokenizers'][0]
+                        else:
+                            cleaned['query_expansion_bm25_tokenizer'] = 'space'
+                
+                elif qe_retrieval_method == 'vectordb':
+                    if 'query_expansion_bm25_tokenizer' in cleaned:
+                        del cleaned['query_expansion_bm25_tokenizer']
+                    
+                    if 'query_expansion_vectordb_name' not in cleaned:
+                        if qe_retrieval_options and qe_retrieval_options.get('vectordb_names'):
+                            cleaned['query_expansion_vectordb_name'] = qe_retrieval_options['vectordb_names'][0]
+                        else:
+                            cleaned['query_expansion_vectordb_name'] = 'default'
+        
+        return cleaned
+    
+    def _parse_query_expansion_config(self, qe_config_str: str) -> Dict[str, Any]:
+        if not qe_config_str or qe_config_str == 'pass_query_expansion':
+            return {'query_expansion_method': 'pass_query_expansion'}
+        
+        parts = qe_config_str.split('::', 2)
+        if len(parts) == 3:
+            method, gen_type, model = parts
+            config = {
+                'query_expansion_method': method,
+                'query_expansion_generator_module_type': gen_type,
+                'query_expansion_model': model
+            }
+            
+            unified_params = self.config_generator.extract_unified_parameters('query_expansion')
+            for gen_config in unified_params.get('generator_configs', []):
+                if (gen_config['method'] == method and 
+                    gen_config['generator_module_type'] == gen_type and 
+                    model in gen_config['models']):
+                    config['query_expansion_llm'] = gen_config.get('llm', 'openai')
+                    if gen_type == 'sap_api':
+                        config['query_expansion_api_url'] = gen_config.get('api_url')
+                    break
+            
+            return config
+        
+        return {'query_expansion_method': qe_config_str}
+    
+    def _parse_reranker_config(self, reranker_config_str: str) -> Dict[str, Any]:
+        print(f"\n[_parse_reranker_config DEBUG] Input: {reranker_config_str}")
+        
+        if not reranker_config_str or reranker_config_str == 'pass_reranker':
+            result = {'passage_reranker_method': 'pass_reranker'}
+            print(f"  Result: {result}")
+            return result
+
+        if reranker_config_str == 'sap_api':
+            config = {
+                'passage_reranker_method': 'sap_api'
+            }
+
+            unified_params = self.config_generator.extract_unified_parameters('passage_reranker')
+            models = unified_params.get('models', {})
+            api_endpoints = unified_params.get('api_endpoints', {})
+            
+            if 'sap_api' in models and models['sap_api']:
+                config['reranker_model_name'] = models['sap_api'][0]
+            else:
+                config['reranker_model_name'] = 'cohere-rerank-v3.5'
+                
+            if 'sap_api' in api_endpoints:
+                config['reranker_api_url'] = api_endpoints['sap_api']
+            
+            print(f"  Result: {config}")
+            return config
+
+        parts = reranker_config_str.split('::', 1)
+        if len(parts) == 2:
+            method, model = parts
+            config = {
+                'passage_reranker_method': method,
+                'reranker_model_name': model
+            }
+            print(f"  Parsed method: {method}, model: {model}")
+            print(f"  Result: {config}")
+
+        result = {'passage_reranker_method': reranker_config_str}
+        print(f"  No :: found, treating as method only")
+        print(f"  Result: {result}")
+        return result
+
+    def _parse_compressor_config(self, comp_config_str: str) -> Dict[str, Any]:
+        if not comp_config_str or comp_config_str == 'pass_compressor':
+            return {'passage_compressor_method': 'pass_compressor'}
+        
+        parts = comp_config_str.split('::', 3) 
+        
+        if len(parts) == 3:
+            method, gen_type, model = parts
+            
+            config = {
+                'passage_compressor_method': method,
+                'compressor_generator_module_type': gen_type,
+                'compressor_model': model
+            }
+
+            unified_params = self.config_generator.extract_unified_parameters('passage_compressor')
+            for comp_config in unified_params.get('compressor_configs', []):
+                if (comp_config['method'] == method and 
+                    comp_config.get('generator_module_type') == gen_type and 
+                    model in comp_config.get('models', [])):
+
+                    config['compressor_llm'] = comp_config.get('llm', 'openai')
+
+                    if gen_type == 'sap_api':
+                        config['compressor_api_url'] = comp_config.get('api_url')
+                    elif gen_type == 'vllm':
+                        config['compressor_llm'] = model
+                        if 'tensor_parallel_size' in comp_config:
+                            config['compressor_tensor_parallel_size'] = comp_config['tensor_parallel_size']
+                        if 'gpu_memory_utilization' in comp_config:
+                            config['compressor_gpu_memory_utilization'] = comp_config['gpu_memory_utilization']
+
+                    if 'batch' in comp_config:
+                        config['compressor_batch'] = comp_config['batch']
+                    break
+            
+            return config
+            
+        elif len(parts) == 2:
+            method = parts[0]
+            second_part = parts[1]
+            
+            config = {
+                'passage_compressor_method': method,
+                'compressor_llm': second_part
+            }
+
+            unified_params = self.config_generator.extract_unified_parameters('passage_compressor')
+            for comp_config in unified_params.get('compressor_configs', []):
+                if comp_config['method'] == method:
+                    if 'llm' in comp_config and comp_config['llm'] == second_part:
+                        if comp_config.get('models'):
+                            config['compressor_model'] = comp_config['models'][0]
+                            config['compressor_generator_module_type'] = comp_config.get('generator_module_type', 'llama_index_llm')
+                    elif second_part in comp_config.get('models', []):
+                        config['compressor_llm'] = comp_config.get('llm', 'openai')
+                        config['compressor_model'] = second_part
+                        config['compressor_generator_module_type'] = comp_config.get('generator_module_type', 'llama_index_llm')
+
+                    if comp_config.get('generator_module_type') == 'sap_api':
+                        config['compressor_api_url'] = comp_config.get('api_url')
+                    break
+            
+            return config
+        
+        return {'passage_compressor_method': comp_config_str}
+    
+    def _parse_generator_config(self, gen_config_str: str) -> Dict[str, Any]:
+        if not gen_config_str:
+            return {}
+        
+        parts = gen_config_str.split('::', 1)
+        if len(parts) == 2:
+            module_type, model = parts
+            config = {
+                'generator_module_type': module_type,
+                'generator_model': model
+            }
+            
+            unified_params = self.config_generator.extract_unified_parameters('generator')
+            for module_config in unified_params.get('module_configs', []):
+                if module_config['module_type'] == module_type and model in module_config['models']:
+                    if module_type == 'sap_api':
+                        config['generator_api_url'] = module_config.get('api_url')
+                        config['generator_llm'] = module_config.get('llm', 'mistralai')
+                    elif module_type == 'vllm':
+                        config['generator_llm'] = model
+                    else:
+                        config['generator_llm'] = module_config.get('llm', 'openai')
+                    break
+            
+            return config
+        
+        return {'generator_model': gen_config_str}
     
     def get_search_space_info(self) -> Dict[str, Any]:
-        unified_space = self.get_unified_space()
+        unified_space = self.unified_extractor.extract_search_space(OptimizationType.SMAC)
         
         n_hyperparameters = len(unified_space)
         n_categorical = 0

@@ -558,8 +558,9 @@ if __name__ == "__main__":
 
     project_root = Utils.find_project_root()
     config_path = Utils.get_centralized_config_path(args.config)
-
-    print(f"Using config: {config_path}")
+    
+    print(f"Using project root: {project_root}")
+    print(f"Using centralized config: {config_path}")
 
     if args.corpus:
         corpus_path = args.corpus

@@ -7,9 +7,17 @@ from typing import Dict, Any, List, Tuple, Optional
 from pipeline.config_manager import ConfigGenerator
 from pipeline.pipeline_executor import RAGPipelineExecutor
 from pipeline.pipeline_evaluator import RAGPipelineEvaluator
-from pipeline.utils import Utils
+from pipeline.utils import Utils                        
+from pipeline_component.sap_embeddings import SAPEmbedding
 
 
+class EarlyStoppingException(Exception):
+    def __init__(self, message, score, component):
+        self.message = message
+        self.score = score
+        self.component = component
+        super().__init__(self.message)
+        
 class RAGPipelineRunner:
     def __init__(
         self,
@@ -26,8 +34,9 @@ class RAGPipelineRunner:
         json_manager=None,
         use_ragas: bool = False, 
         ragas_config: Optional[Dict[str, Any]] = None,
-        use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o"  
+        use_llm_evaluator: bool = False,
+        llm_evaluator_config: Optional[Dict[str, Any]] = None,
+        early_stopping_thresholds: Optional[Dict[str, float]] = None
     ):
         self.config_generator = config_generator
         self.json_manager = json_manager
@@ -44,6 +53,20 @@ class RAGPipelineRunner:
         self.use_ragas = use_ragas
         self.ragas_config = ragas_config or {}
         
+        self.use_llm_evaluator = use_llm_evaluator
+        self.llm_evaluator_config = llm_evaluator_config or {}
+
+        if early_stopping_thresholds is None:
+            self.early_stopping_thresholds = {
+                'retrieval': 0.1,
+                'query_expansion': 0.1,
+                'reranker': 0.2,
+                'filter': 0.25,
+                'compressor': 0.3
+            }
+        else:
+            self.early_stopping_thresholds = early_stopping_thresholds
+        
         self.executor = RAGPipelineExecutor(config_generator)
         self.evaluator = RAGPipelineEvaluator(
             config_generator=config_generator,
@@ -58,12 +81,57 @@ class RAGPipelineRunner:
             generation_weight=generation_weight,
             use_ragas=use_ragas,
             ragas_config=ragas_config,
-            use_llm_compressor_evaluator=use_llm_compressor_evaluator,
-            llm_evaluator_model=llm_evaluator_model
+            use_llm_evaluator=self.use_llm_evaluator, 
+            llm_evaluator_config=self.llm_evaluator_config
         )
+        
+    def _ensure_sap_embeddings_initialized(self, config: Dict[str, Any], trial_dir: str):
+        if config.get('retrieval_method') == 'vectordb':
+            vectordb_name = config.get('vectordb_name', 'default')
+            
+            try:
+                from pipeline_component.retrieval import RetrievalModule
+                
+                retrieval_module = RetrievalModule(
+                    base_project_dir=trial_dir,
+                    use_pregenerated_embeddings=True,
+                    centralized_project_dir=Utils.get_centralized_project_dir()
+                )
+                
+                vectordb_configs = retrieval_module.embedding_manager.get_vectordb_configs(trial_dir)
+                
+                if vectordb_name in vectordb_configs:
+                    vdb_config = vectordb_configs[vectordb_name]
+                    embedding_model = vdb_config.get('embedding_model', '')
+                    
+                    if embedding_model.startswith('http') and 'api.ai.internalprod' in embedding_model:
+                        print(f"[Pipeline] Initializing SAP API embeddings for {vectordb_name}")
+
+                        
+                        sap_embedding = SAPEmbedding(
+                            api_url=embedding_model,
+                            model_type='gemini' if 'gemini' in embedding_model else 'openai'
+                        )
+                        
+                        print(f"[Pipeline] SAP API embedding initialized successfully")
+                        
+            except Exception as e:
+                print(f"[Pipeline] Warning: Could not initialize SAP embeddings: {e}")
+                pass
+        
+    def _check_early_stopping(self, component: str, score: float) -> None:
+        threshold = self.early_stopping_thresholds.get(component)
+        if threshold is not None and score < threshold:
+            print(f"\n[EARLY STOPPING] {component} score {score:.4f} < threshold {threshold}")
+            raise EarlyStoppingException(
+                f"Early stopping at {component}: score {score:.4f} below threshold {threshold}",
+                score=score,
+                component=component
+            )
     
     def save_intermediate_result(self, component: str, working_df: pd.DataFrame, 
-                            results: Dict[str, Any], trial_dir: str, config: Dict[str, Any] = None):
+                                results: Dict[str, Any], trial_dir: str, 
+                                config: Dict[str, Any] = None):
         try:
             debug_dir = os.path.join(trial_dir, "debug_intermediate_results")
             os.makedirs(debug_dir, exist_ok=True)
@@ -89,53 +157,12 @@ class RAGPipelineRunner:
                 'execution_time': results.get('execution_time', 0.0)
             }
             
+            # Add config to summary
             if config:
-                component_specific_config = {}
-                
-                if component == 'query_expansion':
-                    relevant_params = [
-                        'query_expansion_method', 'query_expansion_model', 
-                        'query_expansion_temperature', 'query_expansion_max_token',
-                        'retriever_top_k', 'retrieval_method', 'bm25_tokenizer', 'vectordb_name'
-                    ]
-                elif component == 'retrieval':
-                    relevant_params = [
-                        'retrieval_method', 'retriever_top_k', 
-                        'bm25_tokenizer', 'vectordb_name'
-                    ]
-                elif component == 'passage_reranker':
-                    relevant_params = [
-                        'passage_reranker_method', 'reranker_top_k',
-                        'reranker_model', 'reranker_model_name'
-                    ]
-                elif component == 'passage_filter':
-                    relevant_params = [
-                        'passage_filter_method', 'threshold', 'percentile'
-                    ]
-                elif component == 'passage_compressor':
-                    relevant_params = [
-                        'passage_compressor_method', 'compressor_generator_module_type',
-                        'compressor_model', 'compressor_llm', 'compressor_api_url',
-                        'compressor_batch', 'compressor_temperature', 'compressor_max_tokens'
-                    ]
-                elif component == 'prompt_maker':
-                    relevant_params = [
-                        'prompt_maker_method', 'prompt_template_idx'
-                    ]
-                elif component == 'generator':
-                    relevant_params = [
-                        'generator_model', 'generator_temperature', 'generator_module_type',
-                        'generator_llm', 'generator_api_url'
-                    ]
-                else:
-                    relevant_params = []
-                
-                for param in relevant_params:
-                    if param in config:
-                        component_specific_config[param] = config[param]
-                
-                summary['config'] = component_specific_config
-                summary['full_trial_config'] = Utils.json_serializable(config)
+                summary['config_explored'] = {
+                    'full_config': config,
+                    'component_specific_config': self._extract_component_config(component, config)
+                }
 
             if component in ['retrieval', 'query_expansion']:
                 summary['retrieval_score'] = results.get('retrieval_score', results.get('last_retrieval_score', 0.0))
@@ -165,6 +192,34 @@ class RAGPipelineRunner:
         except Exception as e:
             print(f"[WARNING] Failed to save intermediate results for {component}: {e}")
             pass
+        
+    def _extract_component_config(self, component: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        component_config = {}
+        
+        if component == 'retrieval':
+            relevant_keys = ['retrieval_method', 'retriever_top_k', 'bm25_tokenizer', 'vectordb_name']
+        elif component == 'query_expansion':
+            relevant_keys = ['query_expansion_method', 'query_expansion_model', 
+                            'query_expansion_temperature', 'query_expansion_max_token']
+        elif component == 'passage_reranker':
+            relevant_keys = ['passage_reranker_method', 'reranker_top_k', 'reranker_model']
+        elif component == 'passage_filter':
+            relevant_keys = ['passage_filter_method', 'threshold', 'percentile']
+        elif component == 'passage_compressor':
+            relevant_keys = ['passage_compressor_method', 'compressor_model', 
+                            'lexrank_compression_ratio', 'spacy_model']
+        elif component == 'prompt_maker':
+            relevant_keys = ['prompt_maker_method', 'prompt_template_idx']
+        elif component == 'generator':
+            relevant_keys = ['generator_module_type', 'generator_model', 'generator_temperature']
+        else:
+            relevant_keys = []
+        
+        for key in relevant_keys:
+            if key in config:
+                component_config[key] = config[key]
+        
+        return component_config
     
     def _get_component_score(self, component: str, results: Dict[str, Any]) -> float:
         score_keys = {
@@ -219,6 +274,7 @@ class RAGPipelineRunner:
     def run_pipeline(self, config: Dict[str, Any], trial_dir: str, qa_subset: pd.DataFrame, 
                      is_local_optimization: bool = False, current_component: str = None) -> Dict[str, Any]:
         try:
+            self._ensure_sap_embeddings_initialized(config, trial_dir)
             print("\n" + "="*80)
             print("SELECTED CONFIGURATION FROM OPTIMIZER:")
             print("="*80)
@@ -250,8 +306,8 @@ class RAGPipelineRunner:
 
             if is_local_optimization and current_component:
                 print(f"\n[Local Optimization] Current component: {current_component}")
-                print(f"[Local Optimization] Using saved outputs from previous components")
-
+                print(f"[Local Optimization] Will use saved outputs from previous components")
+                
                 if hasattr(self, 'component_results'):
                     for comp in ['passage_compressor', 'passage_filter', 'passage_reranker', 'retrieval', 'query_expansion']:
                         if comp in self.component_results:
@@ -259,7 +315,7 @@ class RAGPipelineRunner:
                             last_retrieval_score = self.component_results[comp].get('best_score', 0.0)
                             print(f"[Local Optimization] Using score from {comp}: {last_retrieval_score}")
                             break
-                
+
                 if current_component == 'query_expansion':
                     working_df, query_expansion_results, retrieval_df_from_qe, retrieval_done_in_qe = self._run_query_expansion_with_retrieval(
                         config, trial_dir, working_df
@@ -270,7 +326,7 @@ class RAGPipelineRunner:
                         last_retrieval_component = "query_expansion"
                     
                     if save_intermediate:
-                        self.save_intermediate_result('query_expansion', working_df, query_expansion_results, trial_dir, config)
+                        self.save_intermediate_result('query_expansion', working_df, query_expansion_results, trial_dir)
                     
                     return {
                         'retrieval_score': 0.0,
@@ -291,7 +347,7 @@ class RAGPipelineRunner:
                     )
                     
                     if save_intermediate:
-                        self.save_intermediate_result('retrieval', working_df, retrieval_results, trial_dir, config)
+                        self.save_intermediate_result('retrieval', working_df, retrieval_results, trial_dir)
                     
                     return {
                         'retrieval_score': retrieval_results.get('mean_accuracy', 0.0),
@@ -310,9 +366,10 @@ class RAGPipelineRunner:
                     reranker_results = self.evaluator.evaluate_reranker(reranked_df, qa_subset)
                     reranker_score = reranker_results.get('mean_accuracy', 0.0)
                     
+                    self._check_early_stopping('reranker', reranker_score)
                     
                     if save_intermediate:
-                        self.save_intermediate_result('passage_reranker', reranked_df, reranker_results, trial_dir, config)
+                        self.save_intermediate_result('passage_reranker', reranked_df, reranker_results, trial_dir)
                     
                     return {
                         'retrieval_score': 0.0,
@@ -342,9 +399,10 @@ class RAGPipelineRunner:
                     else:
                         filter_results = self.evaluator.evaluate_filter(filtered_df, qa_subset)
                         filter_score = filter_results.get('mean_accuracy', 0.0)
+                        self._check_early_stopping('filter', filter_score)
                     
                     if save_intermediate:
-                        self.save_intermediate_result('passage_filter', filtered_df, filter_results, trial_dir, config)
+                        self.save_intermediate_result('passage_filter', filtered_df, filter_results, trial_dir)
                     
                     return {
                         'retrieval_score': 0.0,
@@ -363,22 +421,20 @@ class RAGPipelineRunner:
                     compressed_df = self.executor.execute_compressor(config, trial_dir, working_df)
                     token_eval_results = self.evaluator.evaluate_compressor(compressed_df, qa_subset)
                     compressor_score = token_eval_results.get('mean_score', 0.0) if token_eval_results else 0.0
-                    llm_mean_score = token_eval_results.get('llm_mean_score', 0.0) if token_eval_results else 0.0
                     
-                    final_score = max(compressor_score, llm_mean_score)
+                    if compressed_df is not working_df:
+                        self._check_early_stopping('compressor', compressor_score)
                     
                     if save_intermediate:
-                        self.save_intermediate_result('passage_compressor', compressed_df, token_eval_results, trial_dir, config)
+                        self.save_intermediate_result('passage_compressor', compressed_df, token_eval_results, trial_dir)
                     
                     return {
                         'retrieval_score': 0.0,
                         'last_retrieval_component': 'passage_compressor',
-                        'last_retrieval_score': final_score,
-                        'combined_score': final_score,
-                        'score': final_score,
-                        'compression_score': final_score,
-                        'compressor_score': final_score,
-                        'llm_mean_score': llm_mean_score,
+                        'last_retrieval_score': compressor_score,
+                        'combined_score': compressor_score,
+                        'score': compressor_score,
+                        'compression_score': compressor_score,
                         'compression_metrics': Utils.json_serializable(token_eval_results),
                         'evaluation_method': 'local_optimization',
                         'working_df': compressed_df
@@ -395,7 +451,7 @@ class RAGPipelineRunner:
 
                     prompts_df = self.executor.execute_prompt_maker(config, trial_dir, working_df)
                     if save_intermediate:
-                        self.save_intermediate_result('prompt_maker', prompts_df, {}, trial_dir, config)
+                        self.save_intermediate_result('prompt_maker', prompts_df, {}, trial_dir)
 
                     eval_df = self.executor.execute_generator(config, trial_dir, prompts_df, working_df, qa_subset)
                     
@@ -406,35 +462,33 @@ class RAGPipelineRunner:
                     generation_results = self._evaluate_generation_traditional(eval_df, qa_subset) if eval_df is not None else {}
                     generation_score = generation_results.get('mean_score', 0.0)
                     
-                    combined_score = (self.retrieval_weight * last_retrieval_score + 
-                     self.generation_weight * generation_score)
-                    
                     if save_intermediate:
                         self.save_intermediate_result('generator', eval_df if eval_df is not None else working_df, 
                                                     {'generation_score': generation_score, 'generation_metrics': generation_results}, 
-                                                    trial_dir, config)
+                                                    trial_dir)
                     
                     return {
                         'retrieval_score': 0.0,
                         'last_retrieval_component': last_retrieval_component,
                         'last_retrieval_score': last_retrieval_score,
-                        'generation_score': generation_score,  
+                        'generation_score': generation_score,
                         'generation_metrics': generation_results,
-                        'combined_score': combined_score, 
-                        'score': combined_score, 
+                        'combined_score': self.evaluator.calculate_combined_score(
+                            last_retrieval_score, generation_score, True
+                        ),
+                        'score': generation_score if generation_score > 0 else last_retrieval_score,
                         'evaluation_method': 'local_optimization',
                         'working_df': working_df,
                         'generated_texts': eval_df['generated_texts'].tolist() if eval_df is not None and 'generated_texts' in eval_df.columns else []
                     }
-
-                            
+                
             else:
                 working_df, query_expansion_results, retrieval_df_from_qe, retrieval_done_in_qe = self._run_query_expansion_with_retrieval(
                     config, trial_dir, qa_subset
                 )
                 
                 if save_intermediate and query_expansion_results:
-                    self.save_intermediate_result('query_expansion', working_df, query_expansion_results, trial_dir, config)
+                    self.save_intermediate_result('query_expansion', working_df, query_expansion_results, trial_dir)
                 
                 if retrieval_done_in_qe and retrieval_df_from_qe is not None:
                     print("[Trial] Skipping retrieval node - already done in query expansion")
@@ -450,7 +504,7 @@ class RAGPipelineRunner:
                     last_retrieval_component = "retrieval"
                     
                     if save_intermediate:
-                        self.save_intermediate_result('retrieval', working_df, retrieval_results, trial_dir, config)
+                        self.save_intermediate_result('retrieval', working_df, retrieval_results, trial_dir)
 
                 working_df, reranker_results, reranker_applied, reranker_score, reranker_last_results = self._run_reranker(
                     config, trial_dir, working_df, qa_subset
@@ -461,7 +515,7 @@ class RAGPipelineRunner:
                     last_retrieval_results = reranker_last_results
                     
                     if save_intermediate:
-                        self.save_intermediate_result('passage_reranker', working_df, reranker_results, trial_dir, config)
+                        self.save_intermediate_result('passage_reranker', working_df, reranker_results, trial_dir)
                 
                 working_df, filter_results, filter_applied, filter_score, filter_last_results = self._run_filter(
                     config, trial_dir, working_df, qa_subset
@@ -472,34 +526,30 @@ class RAGPipelineRunner:
                     last_retrieval_results = filter_last_results
                     
                     if save_intermediate:
-                        self.save_intermediate_result('passage_filter', working_df, filter_results, trial_dir, config)
+                        self.save_intermediate_result('passage_filter', working_df, filter_results, trial_dir)
                 
-                compressor_method = config.get('passage_compressor_method')
-                if compressor_method not in ['pass_compressor', 'pass', None]:
-                    working_df, token_eval_results, compressor_score, compression_results = self._run_compressor(
-                        config, trial_dir, working_df, qa_subset
-                    )
-                    if compression_results:
-                        last_retrieval_component = "passage_compressor"
-                        last_retrieval_score = compressor_score
-                        last_retrieval_results = compression_results
-                        
-                        if save_intermediate:
-                            self.save_intermediate_result('passage_compressor', working_df, token_eval_results, trial_dir, config)
-                else:
-                    print("[Trial] Skipping pass compressor evaluation in global optimization")
+                working_df, token_eval_results, compressor_score, compression_results = self._run_compressor(
+                    config, trial_dir, working_df, qa_subset
+                )
+                if compression_results:
+                    last_retrieval_component = "passage_compressor"
+                    last_retrieval_score = compressor_score
+                    last_retrieval_results = compression_results
+                    
+                    if save_intermediate:
+                        self.save_intermediate_result('passage_compressor', working_df, token_eval_results, trial_dir)
                 
                 prompts_df, prompt_results = self._run_prompt_maker(config, trial_dir, working_df, qa_subset)
                 if save_intermediate:
-                    self.save_intermediate_result('prompt_maker', prompts_df, prompt_results, trial_dir, config)
+                    self.save_intermediate_result('prompt_maker', prompts_df, prompt_results, trial_dir)
                 
                 eval_df = self._run_generator(config, trial_dir, prompts_df, working_df, qa_subset)
                 if save_intermediate and eval_df is not None:
                     generation_results = self._evaluate_generation_traditional(eval_df, qa_subset) if eval_df is not None else {}
                     self.save_intermediate_result('generator', eval_df, 
                                                 {'generation_score': generation_results.get('mean_score', 0.0), 
-                                                'generation_metrics': generation_results}, 
-                                                trial_dir, config)
+                                                 'generation_metrics': generation_results}, 
+                                                trial_dir)
 
             if save_intermediate:
                 self._save_pipeline_summary(trial_dir, last_retrieval_component, last_retrieval_score, 
@@ -862,8 +912,12 @@ class RAGPipelineRunner:
             retrieval_df = self.executor.execute_retrieval(config, trial_dir, qa_subset)
             if retrieval_df is not None:
                 retrieval_results = self.evaluator.evaluate_retrieval(retrieval_df, qa_subset)
+                retrieval_score = retrieval_results.get('mean_accuracy', 0.0)
+                
+                self._check_early_stopping('retrieval', retrieval_score)
+                
                 query_expansion_results = {
-                    'mean_score': retrieval_results.get('mean_accuracy', 0.0),
+                    'mean_score': retrieval_score,
                     'metrics': retrieval_results
                 }
                 working_df = retrieval_df
@@ -875,6 +929,9 @@ class RAGPipelineRunner:
                 working_df, qa_subset, trial_dir, config
             )
             retrieval_done_in_qe = True
+            
+            qe_score = query_expansion_results.get('mean_score', 0.0)
+            self._check_early_stopping('query_expansion', qe_score)
 
             if retrieval_df is not None and isinstance(retrieval_df, pd.DataFrame):
                 Utils.update_dataframe_columns(working_df, retrieval_df, 
@@ -903,10 +960,13 @@ class RAGPipelineRunner:
             Utils.update_dataframe_columns(working_df, retrieval_df,
                 include_cols=['retrieved_ids', 'retrieved_contents', 'retrieve_scores', 'queries'])
         
-        return working_df, retrieval_results, retrieval_results.get('mean_accuracy', 0.0), retrieval_results
+        retrieval_score = retrieval_results.get('mean_accuracy', 0.0)
+        self._check_early_stopping('retrieval', retrieval_score)
+        
+        return working_df, retrieval_results, retrieval_score, retrieval_results
     
     def _run_reranker(self, config: Dict[str, Any], trial_dir: str, working_df: pd.DataFrame,
-            qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], bool, float, Dict[str, Any]]:
+                qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], bool, float, Dict[str, Any]]:
         reranker_results = {}
         reranker_applied = False
         last_score = 0.0
@@ -914,19 +974,21 @@ class RAGPipelineRunner:
         
         reranked_df = self.executor.execute_reranker(config, trial_dir, working_df)
         
+        reranker_results = self.evaluator.evaluate_reranker(reranked_df, qa_subset)
+        last_score = reranker_results.get('mean_accuracy', 0.0)
+        last_results = reranker_results
+        
         if reranked_df is not working_df:
-            reranker_results = self.evaluator.evaluate_reranker(reranked_df, qa_subset)
-            last_score = reranker_results.get('mean_accuracy', 0.0)
-            last_results = reranker_results
             reranker_applied = True
             print(f"Applied reranking, new mean accuracy: {last_score}")
+            self._check_early_stopping('reranker', last_score)
         else:
-            print(f"Pass-through reranking")
+            print(f"Pass-through reranking, mean accuracy: {last_score}")
         
         return reranked_df, reranker_results, reranker_applied, last_score, last_results
     
     def _run_filter(self, config: Dict[str, Any], trial_dir: str, working_df: pd.DataFrame,
-       qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], bool, float, Dict[str, Any]]:
+           qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], bool, float, Dict[str, Any]]:
         filter_results = {}
         filter_applied = False
         last_score = 0.0
@@ -940,7 +1002,18 @@ class RAGPipelineRunner:
                         filtered_df is working_df)
         
         if is_pass_filter:
-            print(f"[Filter] Pass-through filter detected")
+            print(f"[Filter] Pass-through filter detected, using previous results")
+
+            if hasattr(self, 'component_results') and 'passage_reranker' in self.component_results:
+                last_score = self.component_results['passage_reranker'].get('best_score', 0.0)
+                print(f"[Filter] Using score from passage_reranker: {last_score}")
+            else:
+                print(f"[Filter] Warning: No reranker results found")
+                last_score = 0.0
+            
+            filter_results = {'mean_accuracy': last_score}
+            last_results = filter_results
+            
             return working_df, filter_results, filter_applied, last_score, last_results
 
         filter_applied = True
@@ -959,6 +1032,8 @@ class RAGPipelineRunner:
             last_results = filter_results
             
             print(f"[Filter] Applied {filter_method}, new mean accuracy: {last_score}")
+            self._check_early_stopping('filter', last_score)
+            
         except Exception as e:
             print(f"[Filter] Error during evaluation: {e}")
             import traceback
@@ -970,20 +1045,22 @@ class RAGPipelineRunner:
         
         return filtered_df, filter_results, filter_applied, last_score, last_results
     
-    
     def _run_compressor(self, config: Dict[str, Any], trial_dir: str, working_df: pd.DataFrame,
-            qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], float, Dict[str, Any]]:
+                   qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any], float, Dict[str, Any]]:
     
         compressed_df = self.executor.execute_compressor(config, trial_dir, working_df)
-
+        
+        token_eval_results = self.evaluator.evaluate_compressor(compressed_df, qa_subset)
+        last_score = token_eval_results.get('mean_score', 0.0) if token_eval_results else 0.0
+        
         if compressed_df is not working_df:
-            token_eval_results = self.evaluator.evaluate_compressor(compressed_df, qa_subset)
-            last_score = token_eval_results.get('mean_score', 0.0) if token_eval_results else 0.0
             print(f"Applied compression, mean score: {last_score}")
-            return compressed_df, token_eval_results, last_score, token_eval_results
+            self._check_early_stopping('compressor', last_score)
         else:
-            return working_df, {}, 0.0, {}
-    
+            print(f"Pass-through compression, mean score: {last_score}")
+        
+        return compressed_df, token_eval_results, last_score, token_eval_results
+
     def _run_prompt_maker(self, config: Dict[str, Any], trial_dir: str, working_df: pd.DataFrame,
                      qa_subset: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         prompts_df = self.executor.execute_prompt_maker(config, trial_dir, working_df)

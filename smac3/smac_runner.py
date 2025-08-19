@@ -6,6 +6,7 @@ import pandas as pd
 from typing import Optional
 from pipeline.utils import Utils
 from pipeline.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
+from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
 
 
 class UnifiedSMACRunner:
@@ -72,12 +73,27 @@ class UnifiedSMACRunner:
                             choices=['context_precision', 'context_recall', 'answer_relevancy', 
                                     'faithfulness', 'factual_correctness', 'semantic_similarity'],
                             help='Specific RAGAS metrics to use (default: all)')
-        parser.add_argument('--use_llm_compressor_evaluator', action='store_true', default=False,
-                    help='Use LLM-based evaluation for passage compression')
+        
+        parser.add_argument('--use_llm_compressor_evaluator', action='store_true',
+                    help='Use LLM to evaluate compression quality instead of token-based metrics')
         parser.add_argument('--llm_evaluator_model', type=str, default='gpt-4o',
-                            help='LLM model to use for compression evaluation')
+                        help='LLM model to use for compression evaluation (default: gpt-4o)')
+        parser.add_argument('--llm_compressor_temperature', type=float, default=0.0)
+        
+        parser.add_argument('--disable_early_stopping', action='store_true',
+                            help='Disable early stopping for low-scoring components')
             
         return parser
+    
+    def _get_default_early_stopping_thresholds(self):
+        return {
+            'retrieval': 0.1,
+            'query_expansion': 0.1,
+            'reranker': 0.2,
+            'filter': 0.25,
+            'compressor': 0.3
+        }
+    
     
     def _normalize_weights(self, retrieval_weight: float, generation_weight: float) -> tuple:
         total = retrieval_weight + generation_weight
@@ -161,47 +177,89 @@ class UnifiedSMACRunner:
         return ragas_config
     
     def _run_global_optimization(self, args, qa_df, corpus_df, config_template):
-        from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
+        if args.disable_early_stopping:
+            print("\nEarly stopping disabled")
+        else:
+            print("\nEarly stopping enabled with default thresholds:")
+            print("  retrieval/query_expansion < 0.1")
+            print("  reranker < 0.2")
+            print("  filter < 0.25")
+            print("  compressor < 0.3")
         
-        ragas_config = self._prepare_ragas_config(args)
-        
+        if args.use_ragas:
+            ragas_config = {
+                'retrieval_metrics': ["context_precision", "context_recall"],
+                'generation_metrics': ["answer_relevancy", "faithfulness", "factual_correctness", "semantic_similarity"],
+                'llm_model': "gpt-4o-mini",
+                'embedding_model': "text-embedding-ada-002"
+            }
+        else:
+            ragas_config = None
+
+        use_llm_compressor_evaluator = getattr(args, 'use_llm_compressor_evaluator', False)
+        if use_llm_compressor_evaluator:
+            llm_model = getattr(args, "llm_evaluator_model", "gpt-4o")
+            
+            llm_compressor_config = {
+                "llm_model": llm_model,
+                "temperature": 0.0
+            }
+        else:
+            llm_compressor_config = None
+
+        n_trials = getattr(args, 'num_trials', None) or getattr(args, 'n_trials', None) or getattr(args, 'num_samples', None)
+
         optimizer = SMACRAGOptimizer(
             config_template=config_template,
             qa_data=qa_df,
             corpus_data=corpus_df,
             project_dir=args.project_dir,
-            n_trials=args.n_trials,
+            n_trials=n_trials,  
             sample_percentage=args.sample_percentage,
             cpu_per_trial=args.cpu_per_trial,
             retrieval_weight=args.retrieval_weight,
             generation_weight=args.generation_weight,
-            use_cached_embeddings=args.use_cached_embeddings,
-            result_dir=args.result_dir,
-            study_name=args.study_name,
-            walltime_limit=args.walltime_limit,
-            n_workers=args.n_workers,
-            seed=args.seed,
-            early_stopping_threshold=args.early_stopping_threshold,
-            use_wandb=not args.no_wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            wandb_run_name=args.wandb_run_name,
-            optimizer=args.optimizer,
-            use_multi_fidelity=args.use_multi_fidelity,
-            min_budget_percentage=args.min_budget_percentage,
-            max_budget_percentage=args.max_budget_percentage,
-            eta=args.eta,
+            use_cached_embeddings=getattr(args, 'use_cached_embeddings', True),
+            result_dir=getattr(args, 'result_dir', None),
+            study_name=getattr(args, 'study_name', None),
+            walltime_limit=getattr(args, 'walltime_limit', 3600),
+            n_workers=getattr(args, 'n_workers', 1),
+            seed=getattr(args, 'seed', 42),
+            early_stopping_threshold=getattr(args, 'early_stopping_threshold', 0.9),
+            use_wandb=getattr(args, 'use_wandb', True),
+            wandb_project=getattr(args, 'wandb_project', "BO & AutoRAG"),
+            wandb_entity=getattr(args, 'wandb_entity', None),
+            wandb_run_name=getattr(args, 'wandb_run_name', None),
+            optimizer=getattr(args, 'optimizer', 'smac'),
+            use_multi_fidelity=getattr(args, 'use_multi_fidelity', False),
+            min_budget_percentage=getattr(args, 'min_budget_percentage', 0.1),
+            max_budget_percentage=getattr(args, 'max_budget_percentage', 1.0),
+            eta=getattr(args, 'eta', 3),
             use_ragas=args.use_ragas,
             ragas_config=ragas_config,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
+            use_llm_compressor_evaluator=use_llm_compressor_evaluator,
+            llm_evaluator_config=llm_compressor_config
         )
         
         return optimizer.optimize()
-    
+
     def _run_componentwise_optimization(self, args, qa_df, corpus_df, config_template):
         from smac3.local_optimization.componentwise_smac_rag_optimizer import ComponentwiseSMACOptimizer
+
+        use_llm_compressor_evaluator = getattr(args, 'use_llm_compressor_evaluator', False)
         
+        print(f"[DEBUG] use_llm_compressor_evaluator from args: {use_llm_compressor_evaluator}")
+
+        llm_compressor_config = {}
+        if use_llm_compressor_evaluator:
+            llm_model = getattr(args, "llm_evaluator_model",  "gpt-4o")
+            
+            llm_compressor_config = {
+                "llm_model": llm_model,
+                "temperature": getattr(args, "llm_compressor_temperature", 0.0)
+            }
+            print(f"[DEBUG] LLM compressor config: {llm_compressor_config}")
+
         optimizer = ComponentwiseSMACOptimizer(
             config_template=config_template,
             qa_data=qa_df,
@@ -227,10 +285,10 @@ class UnifiedSMACRunner:
             min_budget_percentage=args.min_budget_percentage,
             max_budget_percentage=args.max_budget_percentage,
             eta=args.eta,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
+            use_llm_compressor_evaluator=use_llm_compressor_evaluator,
+            llm_evaluator_config=llm_compressor_config,
         )
-        
+
         return optimizer.optimize()
     
     def run(self, argv=None) -> int:
@@ -303,9 +361,21 @@ class UnifiedSMACRunner:
         
         print(f"\nStarting {args.optimization_mode} optimization...")
         
+        
         if args.optimization_mode == 'componentwise':
             if email_notifier:
                 from smac3.local_optimization.componentwise_smac_rag_optimizer import ComponentwiseSMACOptimizer
+
+                use_llm_compressor_evaluator = getattr(args, 'use_llm_compressor_evaluator', False)
+                llm_compressor_config = {}
+                if use_llm_compressor_evaluator:
+                    llm_model = getattr(args, "llm_evaluator_model", "gpt-4o")
+                    
+                    llm_compressor_config = {
+                        "llm_model": llm_model,
+                        "temperature": getattr(args, "llm_compressor_temperature", 0.0)
+                    }
+                
                 optimizer = ComponentwiseSMACOptimizer(
                     config_template=config_template,
                     qa_data=qa_df,
@@ -326,12 +396,13 @@ class UnifiedSMACRunner:
                     use_wandb=not args.no_wandb,
                     wandb_project=args.wandb_project,
                     wandb_entity=args.wandb_entity,
+                    optimizer=args.optimizer,
                     use_multi_fidelity=args.use_multi_fidelity,
                     min_budget_percentage=args.min_budget_percentage,
                     max_budget_percentage=args.max_budget_percentage,
                     eta=args.eta,
-                    use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,  
-                    llm_evaluator_model=args.llm_evaluator_model 
+                    use_llm_compressor_evaluator=use_llm_compressor_evaluator, 
+                    llm_evaluator_config=llm_compressor_config 
                 )
                 wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
                 best_results = wrapper.run_with_notification(experiment_name=experiment_name)
@@ -340,6 +411,17 @@ class UnifiedSMACRunner:
         else:
             if email_notifier:
                 from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
+                
+                use_llm_compressor_evaluator = getattr(args, 'use_llm_compressor_evaluator', False)
+                llm_compressor_config = {}
+                if use_llm_compressor_evaluator:
+                    llm_model = getattr(args, "llm_evaluator_model", "gpt-4o")
+                    
+                    llm_compressor_config = {
+                        "llm_model": llm_model,
+                        "temperature": getattr(args, "llm_compressor_temperature", 0.0)
+                    }
+                    
                 ragas_config = self._prepare_ragas_config(args)
                 optimizer = SMACRAGOptimizer(
                     config_template=config_template,
@@ -369,14 +451,14 @@ class UnifiedSMACRunner:
                     eta=args.eta,
                     use_ragas=args.use_ragas,
                     ragas_config=ragas_config,
-                    use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,  
-                    llm_evaluator_model=args.llm_evaluator_model 
+                    use_llm_compressor_evaluator=use_llm_compressor_evaluator, 
+                    llm_evaluator_config=llm_compressor_config
                 )
                 wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
                 best_results = wrapper.run_with_notification(experiment_name=experiment_name)
             else:
                 best_results = self._run_global_optimization(args, qa_df, corpus_df, config_template)
-        
+                
         end_time = time.time()
         total_time = end_time - start_time
         hours, remainder = divmod(total_time, 3600)

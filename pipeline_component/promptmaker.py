@@ -117,16 +117,22 @@ class PromptMakerModule:
             self.template_idx = template_idx
             
         print(f"Creating prompts using method={self.method_type}, template_idx={self.template_idx}")
-        
+
         templates = self.config_manager.get_prompt_templates_from_config(
             self.config_manager.config_template, 
             self.method_type
         )
-        
-        if self.template_idx >= len(templates):
+
+        if not templates:
+            print(f"Warning: No templates found for method {self.method_type}, using default")
+            template = "Answer this question based on the context: {query}\n\nContext: {retrieved_contents}\n\nAnswer:"
+        elif self.template_idx >= len(templates):
+            print(f"Warning: Template index {self.template_idx} out of bounds (max: {len(templates)-1}), using index 0")
             self.template_idx = 0
+            template = templates[0]
+        else:
+            template = templates[self.template_idx]
             
-        template = templates[self.template_idx]
         print(f"Using template: {template}")
         
         result_df = df.copy()
@@ -170,14 +176,15 @@ class PromptMakerModule:
                         window_list = [retrieved_text]
                     
                     retrieved_text = "\n\n".join(window_list)
-                
-            if self.method_type in ['fstring', 'long_context_reorder', 'window_replacement']:
+
+            try:
                 prompt = template.format(
                     query=query,
                     retrieved_contents=retrieved_text
                 )
-            else:
-                prompt = f"Answer this question based on the context: {query}\n\nContext: {retrieved_text}"
+            except KeyError as e:
+                print(f"Warning: Template formatting error: {e}. Using fallback template.")
+                prompt = f"Answer this question based on the context: {query}\n\nContext: {retrieved_text}\n\nAnswer:"
             
             prompts.append(prompt)
             

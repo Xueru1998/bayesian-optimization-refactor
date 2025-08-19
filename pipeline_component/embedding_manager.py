@@ -196,6 +196,11 @@ class EmbeddingManager:
         
         vdb_config = vectordb_configs[vectordb_name]
         db_type = vdb_config.get('db_type', 'chroma')
+        embedding_model = vdb_config.get('embedding_model', '')
+        
+        if embedding_model.startswith("http") and "api.ai.internalprod" in embedding_model:
+            return True
+        
         collection_name = vdb_config.get('collection_name', 'openai')
         
         print(f"Checking embeddings for {vectordb_name}: collection={collection_name}, type={db_type}")
@@ -209,10 +214,12 @@ class EmbeddingManager:
                     client = PersistentClient(path=centralized_chroma_path)
                     
                     collection_exists = False
+                    doc_count = 0
                     try:
                         collection = client.get_collection(name=collection_name)
                         collection_exists = True
-                        print(f"Collection '{collection_name}' exists with {collection.count()} documents")
+                        doc_count = collection.count()
+                        print(f"Collection '{collection_name}' exists with {doc_count} documents")
                     except ValueError as e:
                         if "does not exist" in str(e):
                             print(f"Collection '{collection_name}' does not exist")
@@ -223,8 +230,19 @@ class EmbeddingManager:
                         print(f"Error checking collection '{collection_name}': {e}")
                         collection_exists = False
                     
-                    if collection_exists:
-                        return True
+                    if collection_exists and doc_count > 0:
+                        if corpus_df is not None:
+                            expected_count = len(corpus_df)
+                            if doc_count < expected_count * 0.9:
+                                print(f"Collection has {doc_count} docs but corpus has {expected_count} - need to regenerate")
+                                collection_exists = False
+                            else:
+                                return True
+                        else:
+                            return True
+                    elif collection_exists and doc_count == 0:
+                        print(f"Collection exists but is empty - need to generate embeddings")
+                        collection_exists = False
                         
                 except ImportError as e:
                     print(f"ChromaDB not installed: {e}")
@@ -247,7 +265,12 @@ class EmbeddingManager:
             
             try:
                 print(f"Generating embeddings for {vectordb_name}...")
-                asyncio.run(self.generate_vectordb_embeddings(corpus_df, qa_df, vectordb_name, trial_dir))
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.generate_vectordb_embeddings(corpus_df, qa_df, vectordb_name, trial_dir))
+                loop.close()
+                
                 return True
             except Exception as e:
                 print(f"Error generating embeddings: {e}")

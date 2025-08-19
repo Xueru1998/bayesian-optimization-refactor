@@ -1,14 +1,23 @@
 import os
 import pandas as pd
 import numpy as np
-import tempfile
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Optional, Union
 from abc import ABC, abstractmethod
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import gc
-import torch
+import time
+from datetime import datetime, timedelta
+import threading
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
+
 
 class BaseGenerator(ABC):
     
@@ -94,6 +103,351 @@ class OpenAILLM(BaseGenerator):
         return results, usages, []
 
 
+class SAPAPI(BaseGenerator):
+    _shared_token = None
+    _shared_token_expiry = None
+    _token_lock = None
+    _rate_limit_lock = None
+    _last_429_time = None
+    _consecutive_429_count = 0
+    
+    def __init__(self, project_dir: str, llm: str = "mistralai", 
+                 model: str = "mistralai-large-instruct",
+                 api_url: str = None, bearer_token: str = None, 
+                 batch: int = 8, temperature: float = 0.7,
+                 max_tokens: int = 500, **kwargs):
+        super().__init__(project_dir, **kwargs)
+        self.llm = llm
+        self.model = model
+        self.batch = batch
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        
+        self.max_retries = 5
+        self.initial_wait_time = 60
+        self.max_wait_time = 300
+
+        self.api_url = self._resolve_api_url(api_url)
+        
+        self.auth_url = os.getenv('SAP_AUTH_URL')
+        self.client_id = os.getenv('SAP_CLIENT_ID')
+        self.client_secret = os.getenv('SAP_CLIENT_SECRET')
+        
+        if not self.auth_url:
+            raise ValueError("SAP_AUTH_URL not found in .env file. Please set SAP_AUTH_URL in your .env file.")
+        if not self.client_id:
+            raise ValueError("SAP_CLIENT_ID not found in .env file. Please set SAP_CLIENT_ID in your .env file.")
+        if not self.client_secret:
+            raise ValueError("SAP_CLIENT_SECRET not found in .env file. Please set SAP_CLIENT_SECRET in your .env file.")
+        
+        logger.debug(f"SAP API URL resolved to: {self.api_url}")
+        
+        if not self.api_url:
+            raise ValueError("SAP API URL is required. It must be provided in the config file")
+        
+        if SAPAPI._token_lock is None:
+            import threading
+            SAPAPI._token_lock = threading.Lock()
+        
+        if SAPAPI._rate_limit_lock is None:
+            SAPAPI._rate_limit_lock = threading.Lock()
+        
+        self._ensure_valid_token()
+    
+    def _resolve_api_url(self, api_url: str) -> str:
+        if not api_url:
+            logger.error("SAP API URL is required. It must be provided in the config file.")
+            return None
+        
+        logger.debug(f"Using API URL from config: {api_url}")
+        return api_url
+    
+    def _refresh_token(self):
+        with SAPAPI._token_lock:
+            if SAPAPI._shared_token and SAPAPI._shared_token_expiry and datetime.now() < SAPAPI._shared_token_expiry:
+                logger.debug("Using existing valid token from cache")
+                return
+            
+            try:
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+                
+                data = {
+                    'grant_type': 'client_credentials',
+                    'client_id': self.client_id,
+                    'client_secret': self.client_secret
+                }
+                
+                logger.info("Refreshing SAP bearer token...")
+                response = requests.post(
+                    self.auth_url,
+                    headers=headers,
+                    data=data,
+                    timeout=30
+                )
+                response.raise_for_status()
+                
+                token_data = response.json()
+                SAPAPI._shared_token = token_data.get('access_token')
+                expires_in = token_data.get('expires_in', 43199)
+                
+                SAPAPI._shared_token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
+                
+                logger.info(f"Token refreshed successfully. Expires in {expires_in} seconds")
+                
+            except Exception as e:
+                logger.error(f"Failed to refresh token: {e}")
+                raise ValueError(f"Failed to obtain SAP bearer token: {e}")
+    
+    def _ensure_valid_token(self):
+        if not SAPAPI._shared_token or (SAPAPI._shared_token_expiry and datetime.now() >= SAPAPI._shared_token_expiry):
+            self._refresh_token()
+        else:
+            logger.debug("Token is still valid, no refresh needed")
+    
+    def _get_model_type(self) -> str:
+        if any(x in self.model.lower() for x in ['gpt-4o-mini', 'gpt-35-turbo', 'gpt-3.5-turbo']):
+            return 'openai'
+        elif any(x in self.model.lower() for x in ['claude', 'anthropic']):
+            return 'anthropic'
+        elif any(x in self.model.lower() for x in ['gemini']):
+            return 'gemini'
+        elif any(x in self.model.lower() for x in ['mistral']):
+            return 'mistral'
+        else:
+            return 'openai'
+    
+    def _build_request_body(self, prompt: str, generation_params: Dict) -> Dict:
+        model_type = self._get_model_type()
+        
+        if model_type == 'openai' or model_type == 'mistral':
+            return {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": generation_params.get("max_tokens", self.max_tokens),
+                "temperature": generation_params.get("temperature", self.temperature)
+            }
+        
+        elif model_type == 'anthropic':
+            return {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": generation_params.get("max_tokens", self.max_tokens),
+                "messages": [{"role": "user", "content": prompt}]
+            }
+        
+        elif model_type == 'gemini':
+            return {
+                "generation_config": {
+                    "maxOutputTokens": generation_params.get("max_tokens", self.max_tokens),
+                    "temperature": generation_params.get("temperature", self.temperature)
+                },
+                "contents": {
+                    "role": "user",
+                    "parts": {"text": prompt}
+                }
+            }
+        
+        else:
+            return {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": generation_params.get("max_tokens", self.max_tokens),
+                "temperature": generation_params.get("temperature", self.temperature)
+            }
+    
+    def _extract_response_content(self, data: Dict) -> str:
+        model_type = self._get_model_type()
+        
+        try:
+            if model_type == 'openai' or model_type == 'mistral':
+                if 'choices' in data and len(data['choices']) > 0:
+                    return data['choices'][0]['message']['content']
+            
+            elif model_type == 'anthropic':
+                if 'content' in data and len(data['content']) > 0:
+                    return data['content'][0]['text']
+            
+            elif model_type == 'gemini':
+                if 'candidates' in data and len(data['candidates']) > 0:
+                    candidate = data['candidates'][0]
+                    if 'content' in candidate and 'parts' in candidate['content']:
+                        parts = candidate['content']['parts']
+                        if len(parts) > 0 and 'text' in parts[0]:
+                            return parts[0]['text']
+            
+            else:
+                if 'choices' in data and len(data['choices']) > 0:
+                    return data['choices'][0]['message']['content']
+            
+            logger.error(f"Could not extract content from response: {data}")
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error extracting response content: {e}")
+            return ""
+    
+    def _extract_usage_info(self, data: Dict) -> Dict:
+        model_type = self._get_model_type()
+        
+        try:
+            if model_type == 'openai' or model_type == 'mistral':
+                if 'usage' in data:
+                    return {
+                        'prompt_tokens': data['usage'].get('prompt_tokens', 0),
+                        'completion_tokens': data['usage'].get('completion_tokens', 0),
+                        'total_tokens': data['usage'].get('total_tokens', 0)
+                    }
+            
+            elif model_type == 'anthropic':
+                if 'usage' in data:
+                    return {
+                        'prompt_tokens': data['usage'].get('input_tokens', 0),
+                        'completion_tokens': data['usage'].get('output_tokens', 0),
+                        'total_tokens': data['usage'].get('input_tokens', 0) + data['usage'].get('output_tokens', 0)
+                    }
+            
+            elif model_type == 'gemini':
+                if 'usageMetadata' in data:
+                    usage = data['usageMetadata']
+                    prompt_tokens = usage.get('promptTokenCount', 0)
+                    completion_tokens = usage.get('candidatesTokenCount', 0)
+                    return {
+                        'prompt_tokens': prompt_tokens,
+                        'completion_tokens': completion_tokens,
+                        'total_tokens': usage.get('totalTokenCount', 0)
+                    }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error extracting usage info: {e}")
+            return {}
+    
+    def _handle_rate_limit(self, retry_attempt: int):
+        with SAPAPI._rate_limit_lock:
+            SAPAPI._last_429_time = datetime.now()
+            SAPAPI._consecutive_429_count += 1
+            
+            wait_time = min(
+                self.initial_wait_time * (2 ** retry_attempt),
+                self.max_wait_time
+            )
+            
+            if SAPAPI._consecutive_429_count > 3:
+                wait_time = self.max_wait_time
+            
+            logger.warning(f"Rate limit hit (429). Waiting {wait_time} seconds before retry. "
+                         f"Retry attempt: {retry_attempt + 1}/{self.max_retries}, "
+                         f"Consecutive 429s: {SAPAPI._consecutive_429_count}")
+            
+            time.sleep(wait_time)
+    
+    def _reset_rate_limit_counter(self):
+        with SAPAPI._rate_limit_lock:
+            if SAPAPI._last_429_time and (datetime.now() - SAPAPI._last_429_time).seconds > 300:
+                SAPAPI._consecutive_429_count = 0
+    
+    def _make_api_request(self, prompt: str, generation_params: Dict, retry_count: int = 0) -> tuple:
+        self._ensure_valid_token()
+        self._reset_rate_limit_counter()
+        
+        headers = {
+            "ai-resource-group": "enterpriseAIgroup",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {SAPAPI._shared_token}"
+        }
+        
+        request_body = self._build_request_body(prompt, generation_params)
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=headers,
+                    json=request_body,
+                    timeout=60
+                )
+                
+                if response.status_code == 429:
+                    self._handle_rate_limit(attempt)
+                    continue
+                
+                if response.status_code == 401 and retry_count < 2:
+                    logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
+                    self._refresh_token()
+                    return self._make_api_request(prompt, generation_params, retry_count + 1)
+                
+                response.raise_for_status()
+                
+                with SAPAPI._rate_limit_lock:
+                    SAPAPI._consecutive_429_count = 0
+                
+                data = response.json()
+                content = self._extract_response_content(data)
+                usage = self._extract_usage_info(data)
+                
+                return content, usage
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    self._handle_rate_limit(attempt)
+                    continue
+                elif e.response.status_code == 401 and retry_count < 2:
+                    logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
+                    self._refresh_token()
+                    return self._make_api_request(prompt, generation_params, retry_count + 1)
+                else:
+                    logger.error(f"SAP API HTTP error: {e}")
+                    if attempt < self.max_retries - 1:
+                        wait_time = 5 * (attempt + 1)
+                        logger.info(f"Retrying after {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                    return "", {}
+                    
+            except requests.exceptions.Timeout as e:
+                logger.error(f"SAP API timeout error: {e}")
+                if attempt < self.max_retries - 1:
+                    wait_time = 10 * (attempt + 1)
+                    logger.info(f"Retrying after timeout in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                return "", {}
+                
+            except Exception as e:
+                logger.error(f"SAP API error: {e}")
+                if attempt < self.max_retries - 1:
+                    wait_time = 5 * (attempt + 1)
+                    logger.info(f"Retrying after error in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                return "", {}
+        
+        logger.error(f"Failed to get response after {self.max_retries} attempts")
+        return "", {}
+    
+    def _pure(self, prompts: List[str], **kwargs) -> tuple:
+        generation_params = {
+            "temperature": kwargs.get("temperature", self.temperature),
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens)
+        }
+        
+        results = []
+        usages = []
+        
+        for i in range(0, len(prompts), self.batch):
+            batch_prompts = prompts[i:i + self.batch]
+            
+            for prompt in batch_prompts:
+                content, usage = self._make_api_request(prompt, generation_params)
+                results.append(content)
+                usages.append(usage)
+                
+                if SAPAPI._consecutive_429_count > 0:
+                    time.sleep(2)
+        
+        return results, usages, []
+
+
 class Vllm(BaseGenerator):
     
     def __init__(self, project_dir: str, llm: str, model: str = None, **kwargs):
@@ -118,16 +472,35 @@ class Vllm(BaseGenerator):
     def cleanup(self):
         if hasattr(self, 'vllm_model'):
             try:
+                from vllm.distributed import destroy_model_parallel
+                from vllm.distributed import destroy_distributed_environment
+                import torch
+                
                 if hasattr(self.vllm_model, 'llm_engine'):
                     if hasattr(self.vllm_model.llm_engine, 'model_executor'):
                         self.vllm_model.llm_engine.model_executor.shutdown()
                 
                 del self.vllm_model
                 
+                try:
+                    destroy_model_parallel()
+                except:
+                    pass
+                
+                try:
+                    destroy_distributed_environment()
+                except:
+                    pass
+                
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
+                    
+                    for i in range(torch.cuda.device_count()):
+                        with torch.cuda.device(i):
+                            torch.cuda.empty_cache()
                 
+                import gc
                 gc.collect()
                 
                 if torch.distributed.is_initialized():
@@ -155,63 +528,6 @@ class Vllm(BaseGenerator):
             usages.append({})
         
         return results, usages, []
-
-
-class VllmAPI(BaseGenerator):
-    
-    def __init__(self, project_dir: str, llm: str, uri: str, batch: int = 8, max_tokens: int = 400, **kwargs):
-        super().__init__(project_dir, **kwargs)
-        self.llm = llm
-        self.uri = uri
-        self.batch = batch
-        self.max_tokens = max_tokens
-        
-        import requests
-        self.requests = requests
-    
-    def _pure(self, prompts: List[str], **kwargs) -> tuple:
-        results = []
-        usages = []
-        
-        params = {
-            "model": self.llm,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "top_p": kwargs.get("top_p", 1.0),
-        }
-        
-        for i in range(0, len(prompts), self.batch):
-            batch_prompts = prompts[i:i + self.batch]
-            
-            for prompt in batch_prompts:
-                try:
-                    response = self.requests.post(
-                        f"{self.uri}/v1/completions",
-                        json={
-                            "prompt": prompt,
-                            **params
-                        }
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    if "choices" in data and len(data["choices"]) > 0:
-                        results.append(data["choices"][0]["text"])
-                    else:
-                        results.append("")
-                    
-                    if "usage" in data:
-                        usages.append(data["usage"])
-                    else:
-                        usages.append({})
-                        
-                except Exception as e:
-                    logger.error(f"VLLM API error: {e}")
-                    results.append("")
-                    usages.append({})
-        
-        return results, usages, []
-
 
 class LlamaIndexLLM(BaseGenerator):
     
@@ -285,190 +601,6 @@ class LlamaIndexLLM(BaseGenerator):
         return results, usages, []
 
 
-class GeneratorModule:
-    
-    def __init__(self, model_name="openai", model_type="gpt-4o-mini", batch_size=8, **kwargs):
-        self.model_name = model_name
-        self.model_type = model_type
-        self.batch_size = batch_size
-        self.generator = None
-        self.temp_dir = tempfile.mkdtemp(prefix="autorag_gen_")
-        self.extra_kwargs = kwargs  
-        self.runtime_temperature = None
-        
-    def __del__(self):
-        self.cleanup()
-    
-    def cleanup(self):
-        if self.generator:
-            if self.model_name == "vllm" and hasattr(self.generator, 'cleanup'):
-                try:
-                    self.generator.cleanup()
-                except Exception as e:
-                    logger.error(f"Error cleaning up vLLM: {e}")
-            
-            del self.generator
-            self.generator = None
-            
-        if hasattr(self, 'temp_dir') and self.temp_dir:
-            import shutil
-            try:
-                shutil.rmtree(self.temp_dir)
-            except:
-                pass
-
-    def _initialize_generator(self):
-        if self.generator:
-            return self.generator
-            
-        if self.model_name == "openai":
-            self.generator = OpenAILLM(
-                project_dir=self.temp_dir,
-                llm=self.model_type,
-                batch=self.batch_size
-            )
-        
-        elif self.model_name == "vllm":
-            vllm_kwargs = {k: v for k, v in self.extra_kwargs.items() if k != 'batch'}
-            
-            if 'gpu_memory_utilization' not in vllm_kwargs:
-                vllm_kwargs['gpu_memory_utilization'] = 0.8
-            
-            self.generator = Vllm(
-                project_dir=self.temp_dir,
-                llm=self.model_type,
-                model=self.model_type,
-                **vllm_kwargs
-            )
-        
-        elif self.model_name == "vllm_api":
-            if 'uri' not in self.extra_kwargs:
-                raise ValueError("URI is required for vllm_api generator")
-            
-            self.generator = VllmAPI(
-                project_dir=self.temp_dir,
-                llm=self.model_type,
-                uri=self.extra_kwargs['uri'],
-                batch=self.batch_size,
-                max_tokens=int(self.extra_kwargs.get('max_tokens', 400))
-            )
-        
-        elif self.model_name == "llama_index":
-            llm_provider = self.extra_kwargs.get('llm', 'openai')
-
-            if isinstance(llm_provider, list):
-                llm_provider = llm_provider[0] if llm_provider else 'openai'
-
-            temperature = self.runtime_temperature if self.runtime_temperature is not None else self.extra_kwargs.get('temperature', 0.7)
-            self.generator = LlamaIndexLLM(
-                project_dir=self.temp_dir,
-                llm=llm_provider,
-                model=self.model_type,
-                batch=self.batch_size,
-                temperature=temperature,
-                max_tokens=self.extra_kwargs.get('max_tokens', 256)
-            )
-        
-        else:
-            raise ValueError(f"Unsupported model name: {self.model_name}")
-        
-        return self.generator
-    
-    
-    def generate(self, prompts: List[str], max_tokens: int = None, temperature: float = 0.7) -> List[str]:
-        generator = self._initialize_generator()
-        
-        generation_params = {}
-
-        if self.model_name == "llama_index":
-            try:
-                generated_texts, _, _ = generator._pure(prompts)
-                return generated_texts
-            except Exception as e:
-                print(f"Error in text generation: {e}")
-                import traceback
-                traceback.print_exc()
-                return ["Error generating text."] * len(prompts)
-
-        if temperature is not None:
-            generation_params["temperature"] = float(temperature)
-        
-        if max_tokens is not None:
-            generation_params["max_tokens"] = int(max_tokens)
-        elif self.model_name == "vllm":
-            generation_params["max_tokens"] = 256
-        elif hasattr(self, 'extra_kwargs') and 'max_tokens' in self.extra_kwargs:
-            try:
-                generation_params["max_tokens"] = int(self.extra_kwargs['max_tokens'])
-            except (ValueError, TypeError):
-                generation_params["max_tokens"] = 256
-            
-        try:
-            generated_texts, _, _ = generator._pure(prompts, **generation_params)
-            return generated_texts
-        except Exception as e:
-            print(f"Error in text generation: {e}")
-            import traceback
-            traceback.print_exc()
-            return ["Error generating text."] * len(prompts)
-    
-    def generate_from_dataframe(self, df: pd.DataFrame, prompt_column: str = 'prompts', 
-                            output_column: str = 'generated_texts',
-                            **generation_params) -> pd.DataFrame:
-        if prompt_column not in df.columns:
-            raise ValueError(f"Prompt column '{prompt_column}' not found in dataframe")
-        
-        prompts = df[prompt_column].tolist()
-
-        if 'temperature' in generation_params and self.model_name == "llama_index":
-            self.runtime_temperature = generation_params.get('temperature')
-            self.generator = None
-        
-        print(f"Generating responses for {len(prompts)} prompts using {self.model_name}:{self.model_type}...")
-        generated_texts = self.generate(prompts, **generation_params)
-        
-        result_df = df.copy()
-        result_df[output_column] = generated_texts
-        
-        return result_df
-    
-    def pure(self, previous_result: pd.DataFrame, **kwargs) -> pd.DataFrame:
-        return self.generator.pure(previous_result, **kwargs)
-    
-    async def agenerate(self, prompt: str, **kwargs) -> str:
-        generator = self._initialize_generator()
-        
-        if not hasattr(generator, 'astream'):
-            raise NotImplementedError(f"Asynchronous generation not supported for {self.model_name} model")
-        
-        full_text = ""
-        async for chunk in generator.astream(prompt, **kwargs):
-            full_text = chunk
-            
-        return full_text
-    
-    def stream(self, prompt: str, callback=None, **kwargs):
-        generator = self._initialize_generator()
-        
-        import asyncio
-        
-        async def _stream():
-            full_text = ""
-            async for chunk in generator.astream(prompt, **kwargs):
-                if callback:
-                    callback(chunk)
-                full_text = chunk
-            return full_text
-            
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_stream())
-    
-    def structured_output(self, prompts: List[str], output_class):
-        generator = self._initialize_generator()
-        
-        return generator.structured_output(prompts, output_class)
-
-
 def make_generator_callable_param(kwargs: Dict[str, Any]) -> tuple:
     
     generator_module_type = kwargs.pop("generator_module_type", "llama_index_llm")
@@ -481,6 +613,18 @@ def make_generator_callable_param(kwargs: Dict[str, Any]) -> tuple:
             "batch": kwargs.pop("batch", 8),
             "temperature": kwargs.pop("temperature", 0.7),
             "max_tokens": kwargs.pop("max_tokens", 256)
+        }
+    
+    elif generator_module_type == "sap_api":
+        generator_class = SAPAPI
+        generator_params = {
+            "llm": kwargs.pop("llm", "mistralai"),
+            "model": kwargs.pop("model", "mistralai-large-instruct"),
+            "api_url": kwargs.pop("api_url", None),
+            "bearer_token": None,
+            "batch": kwargs.pop("batch", 8),
+            "temperature": kwargs.pop("temperature", 0.7),
+            "max_tokens": kwargs.pop("max_tokens", 500)
         }
     
     elif generator_module_type == "openai":
@@ -502,15 +646,6 @@ def make_generator_callable_param(kwargs: Dict[str, Any]) -> tuple:
         
         if "gpu_memory_utilization" not in generator_params:
             generator_params["gpu_memory_utilization"] = 0.8
-    
-    elif generator_module_type == "vllm_api":
-        generator_class = VllmAPI
-        generator_params = {
-            "llm": kwargs.pop("llm", "default"),
-            "uri": kwargs.pop("uri"),
-            "batch": kwargs.pop("batch", 8),
-            "max_tokens": kwargs.pop("max_tokens", 400)
-        }
 
     else:
         raise ValueError(f"Unknown generator module type: {generator_module_type}")
@@ -518,121 +653,104 @@ def make_generator_callable_param(kwargs: Dict[str, Any]) -> tuple:
     return generator_class, generator_params
 
 
-def create_model_provider_map():
-    return {
-        "gpt-4o": "openai",
-        "gpt-4o-mini": "openai",
-        "gpt-4": "openai",
-        "gpt-3.5-turbo": "openai",
-        "gpt-3.5-turbo-16k": "openai",
-        "gpt-4-turbo": "openai",
-        
-        "mistralai/Mistral-7B-Instruct-v0.2": "vllm",
-        "mistralai/Mistral-7B-v0.1": "vllm",
-        "mistralai/Mixtral-8x7B-Instruct-v0.1": "vllm",
-        "meta-llama/Llama-2-7b-hf": "vllm",
-        "meta-llama/Llama-2-13b-hf": "vllm",
-        "meta-llama/Llama-2-70b-hf": "vllm",
-        "meta-llama/Llama-2-7b-chat-hf": "vllm",
-        "meta-llama/Llama-2-13b-chat-hf": "vllm",
-        "meta-llama/Llama-2-70b-chat-hf": "vllm",
-        "Qwen/Qwen-7B": "vllm",
-        "Qwen/Qwen-7B-Chat": "vllm",
-        "Qwen/Qwen-14B": "vllm",
-        "Qwen/Qwen-14B-Chat": "vllm",
-        "TheBloke/Mistral-7B-Instruct-v0.2-AWQ": "vllm",
-        "TheBloke/Mixtral-8x7B-Instruct-v0.1-AWQ": "vllm",
-        "TheBloke/Llama-2-7B-AWQ": "vllm",
-        "TheBloke/Llama-2-13B-AWQ": "vllm",
-        "TheBloke/CodeLlama-7B-AWQ": "vllm",
-        "TheBloke/CodeLlama-13B-AWQ": "vllm",
-        "TheBloke/TinyLlama-1.1B-Chat-v1.0-AWQ": "vllm",
-        "TheBloke/Llama-2-7B-AWQ": "vllm",
-    }
-
-
-def get_provider_for_model(model_name: str) -> str:
-    model_provider_map = create_model_provider_map()
+class GeneratorWrapper:
     
-    if model_name in model_provider_map:
-        return model_provider_map[model_name]
+    def __init__(self, generator_instance: BaseGenerator):
+        self.generator = generator_instance
+    
+    def generate(self, prompts: List[str], **kwargs) -> List[str]:
+        results, _, _ = self.generator._pure(prompts, **kwargs)
+        return results
+    
+    def generate_from_dataframe(self, df: pd.DataFrame, prompt_column: str = 'prompts',
+                              output_column: str = 'generated_texts', **kwargs) -> pd.DataFrame:
+        if prompt_column not in df.columns:
+            raise ValueError(f"Prompt column '{prompt_column}' not found in dataframe")
+        
+        result_df = self.generator.pure(df, **kwargs)
+        return result_df
+    
+    def pure(self, previous_result: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        return self.generator.pure(previous_result, **kwargs)
+    
+    def cleanup(self):
+        if hasattr(self.generator, 'cleanup'):
+            self.generator.cleanup()
 
-    for prefix, provider in model_provider_map.items():
-        if model_name.startswith(prefix):
-            return provider
 
-    print(f"Warning: Unknown model '{model_name}', defaulting to llama_index provider")
-    return "llama_index"
-
-
-def create_generator(model: str = None, module_type: str = None, uri: str = None, 
-                    batch_size: int = 8, max_tokens: int = None, **kwargs) -> GeneratorModule:
-
-    if max_tokens is not None:
-        try:
-            kwargs['max_tokens'] = int(max_tokens)
-        except (ValueError, TypeError):
-            kwargs['max_tokens'] = 256
-
-    if module_type == "vllm_api":
-        if not uri:
-            raise ValueError("URI is required for vllm_api generator")
-        return GeneratorModule(
-            model_name="vllm_api", 
-            model_type=model,
-            batch_size=batch_size,
-            uri=uri,
+def create_generator(model: str, provider: Optional[str] = None, 
+                    project_dir: str = "./", **kwargs) -> GeneratorWrapper:
+    
+    if not provider:
+        provider = _detect_provider(model)
+    
+    if 'module_type' in kwargs:
+        provider = kwargs.pop('module_type')
+    if 'batch_size' in kwargs:
+        kwargs['batch'] = kwargs.pop('batch_size')
+    
+    if provider in ['openai', 'openai_llm']:
+        generator = OpenAILLM(
+            project_dir=project_dir,
+            llm=model,
+            batch=kwargs.pop('batch', 8),
             **kwargs
         )
-    elif module_type == "vllm":
-        vllm_kwargs = {k: v for k, v in kwargs.items() if k != 'batch'}
-        
+    
+    elif provider == 'sap_api':
+        generator = SAPAPI(
+            project_dir=project_dir,
+            model=model,
+            llm=kwargs.pop('llm', 'mistralai'),
+            api_url=kwargs.pop('api_url', None),
+            bearer_token=None,
+            batch=kwargs.pop('batch', 8),
+            temperature=kwargs.pop('temperature', 0.7),
+            max_tokens=kwargs.pop('max_tokens', 500),
+            **kwargs
+        )
+    
+    elif provider == 'vllm':
+        vllm_kwargs = kwargs.copy()
         if 'gpu_memory_utilization' not in vllm_kwargs:
             vllm_kwargs['gpu_memory_utilization'] = 0.8
         
-        return GeneratorModule(
-            model_name="vllm",
-            model_type=model,
-            batch_size=batch_size,
+        generator = Vllm(
+            project_dir=project_dir,
+            llm=model,
+            model=kwargs.pop('model', model),
             **vllm_kwargs
         )
-    elif module_type == "openai":
-        return GeneratorModule(
-            model_name="openai",
-            model_type=model,
-            batch_size=batch_size,
+    
+    elif provider in ['llama_index', 'llama_index_llm']:
+        generator = LlamaIndexLLM(
+            project_dir=project_dir,
+            llm=kwargs.pop('llm', 'openai'),
+            model=model,
+            batch=kwargs.pop('batch', 8),
+            temperature=kwargs.pop('temperature', 0.7),
+            max_tokens=kwargs.pop('max_tokens', 256),
             **kwargs
         )
-    elif module_type == "llama_index":
-        if 'llm' not in kwargs:
-            kwargs['llm'] = 'openai'
-        return GeneratorModule(
-            model_name="llama_index",
-            model_type=model,
-            batch_size=batch_size,
-            **kwargs
-        )
+    
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+    
+    return GeneratorWrapper(generator)
 
-    if model:
-        provider = get_provider_for_model(model)
-        if provider == "vllm":
-            vllm_kwargs = {k: v for k, v in kwargs.items() if k != 'batch'}
-            
-            if 'gpu_memory_utilization' not in vllm_kwargs:
-                vllm_kwargs['gpu_memory_utilization'] = 0.8
-            
-            return GeneratorModule(
-                model_name=provider,
-                model_type=model,
-                batch_size=batch_size,
-                **vllm_kwargs
-            )
-        else:
-            return GeneratorModule(
-                model_name=provider,
-                model_type=model,
-                batch_size=batch_size,
-                **kwargs
-            )
 
-    return GeneratorModule(batch_size=batch_size, **kwargs)
+def _detect_provider(model: str) -> str:
+    
+    model_lower = model.lower()
+    
+    if any(x in model_lower for x in ['gpt', 'o1-mini', 'o1-preview']):
+        return 'openai'
+    
+    elif any(x in model_lower for x in ['mistralai-large-instruct', 'gpt-4o-mini', 'gpt-35-turbo', 'claude', 'anthropic', 'gemini']):
+        return 'sap_api'
+    
+    elif any(x in model_lower for x in ['mistral', 'llama', 'qwen', 'mixtral']):
+        return 'vllm'
+    
+    else:
+        return 'llama_index'

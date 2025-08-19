@@ -1,4 +1,4 @@
 from .componentwise_grid_search import ComponentwiseGridSearch
-from .componentwise_bayesian_optimization import ComponentwiseBayesianOptimization
+from .componentwise_bayesian_optimization import ComponentwiseOptunaOptimizer
 
-__all__ = ['ComponentwiseGridSearch', 'ComponentwiseBayesianOptimization']
+__all__ = ['ComponentwiseGridSearch', 'ComponentwiseOptunaOptimizer']

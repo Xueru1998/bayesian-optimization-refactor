@@ -6,6 +6,8 @@ import json
 import numpy as np
 from typing import Dict, Any, List, Union, Optional
 
+import yaml
+
 from pipeline_component.generator import create_generator
 
 
@@ -327,58 +329,9 @@ class Utils:
             
         except Exception as e:
             print(f"Warning: Error saving CSV: {e}")
-            return {}
-    
-    @staticmethod
-    def get_storage_type(storage_name: str) -> str:
-        db_keywords = ['postgresql', 'mysql']
-        return "cloud_database" if any(kw in storage_name.lower() for kw in db_keywords) else "local_sqlite"
-        
-    @staticmethod
-    def copy_data_to_trial_dir(centralized_project_dir: str, trial_dir: str):
-        src_data_dir = os.path.join(centralized_project_dir, "data")
-        dst_data_dir = os.path.join(trial_dir, "data")
-        os.makedirs(dst_data_dir, exist_ok=True)
+            return {}        
+  
 
-        for fname in ["corpus.parquet", "qa_validation.parquet"]:
-            src_file = os.path.join(src_data_dir, fname)
-            dst_file = os.path.join(dst_data_dir, fname)
-            if os.path.exists(src_file):
-                shutil.copyfile(src_file, dst_file)
-    
-    @staticmethod
-    def populate_retrieved_contents(df: pd.DataFrame, trial_dir: str) -> pd.DataFrame:
-        try:
-            corpus_path = os.path.join(trial_dir, "data", "corpus.parquet")
-            if not os.path.exists(corpus_path):
-                corpus_path = os.path.join(Utils.get_centralized_project_dir(), "data", "corpus.parquet")
-            
-            if not os.path.exists(corpus_path):
-                print(f"[WARNING] Corpus file not found at {corpus_path}")
-                return df
-            
-            corpus_df = pd.read_parquet(corpus_path)
-
-            if 'doc_id' in corpus_df.columns and 'contents' in corpus_df.columns:
-                id_to_content = dict(zip(corpus_df['doc_id'], corpus_df['contents']))
-            else:
-                print(f"[WARNING] Corpus missing required columns. Found: {corpus_df.columns.tolist()}")
-                return df
-
-            if 'retrieved_ids' in df.columns:
-                def get_contents_from_ids(ids):
-                    if isinstance(ids, list):
-                        return [id_to_content.get(doc_id, "") for doc_id in ids]
-                    return []
-                
-                df['retrieved_contents'] = df['retrieved_ids'].apply(get_contents_from_ids)
-                print(f"[Local Optimization] Successfully populated retrieved_contents for {len(df)} rows")
-            
-            return df
-            
-        except Exception as e:
-            print(f"[WARNING] Failed to populate retrieved_contents: {e}")
-            return df
     
     @staticmethod
     def update_dataframe_columns(target_df: pd.DataFrame, source_df: pd.DataFrame, 
@@ -423,45 +376,50 @@ class Utils:
     
     @staticmethod
     def create_generator_from_config(model_name: str, generator_config: Optional[Dict[str, Any]], 
-                                   module_type: str = None) -> Any:
+                                module_type: str = None) -> Any:
+        
         if not generator_config:
             return create_generator(model=model_name)
+        
+        generator_kwargs = {
+            'model': model_name,
+            'batch_size': generator_config.get('batch', 8)
+        }
+        
+        provider_mapping = {
+            'vllm': 'vllm',
+            'openai': 'openai',
+            'openai_llm': 'openai',
+            'llama_index': 'llama_index',
+            'llama_index_llm': 'llama_index',
+            'sap_api': 'sap_api',
+        }
+        
+        provider = provider_mapping.get(module_type)
+        if provider:
+            generator_kwargs['provider'] = provider
+    
+        if module_type == 'sap_api':
+            generator_kwargs['api_url'] = generator_config.get('api_url')
+            generator_kwargs['bearer_token'] = generator_config.get('bearer_token')
+            generator_kwargs['llm'] = generator_config.get('llm', 'mistralai')
+            generator_kwargs['max_tokens'] = generator_config.get('max_tokens', 500)
             
-        if module_type == 'vllm_api':
-            if 'uri' not in generator_config:
-                raise ValueError("URI is required for vllm_api generator")
-            
-            return create_generator(
-                model=model_name,
-                module_type='vllm_api',
-                uri=generator_config.get('uri'),
-                max_tokens=generator_config.get('max_tokens', 400)
-            )
         elif module_type == 'vllm':
-            try:
-                return create_generator(
-                    model=model_name,
-                    module_type='vllm'
-                )
-            except Exception as e:
-                print(f"Failed to initialize vLLM, falling back to llama_index: {e}")
-                return create_generator(
-                    model=model_name,
-                    module_type='llama_index'
-                )
-        elif module_type == 'openai':
-            return create_generator(
-                model=model_name,
-                module_type='openai'
-            )
-        elif module_type == 'llama_index':
-            return create_generator(
-                model=model_name,
-                module_type='llama_index',
-                llm=generator_config.get('llm', 'openai')
-            )
-        else:
+            for key in ['tensor_parallel_size', 'gpu_memory_utilization']:
+                if key in generator_config:
+                    generator_kwargs[key] = generator_config[key]
+                    
+        elif module_type in ['llama_index', 'llama_index_llm']:
+            generator_kwargs['llm'] = generator_config.get('llm', 'openai')
+            
+        
+        try:
+            return create_generator(**generator_kwargs)
+        except Exception as e:
+            print(f"Failed to create generator with config, falling back to default: {e}")
             return create_generator(model=model_name)
+
     
     @staticmethod
     def get_temperature_from_config(config: Dict[str, Any], generator_config: Optional[Dict[str, Any]], 
@@ -479,24 +437,125 @@ class Utils:
     
     @staticmethod
     def detect_module_type(config: Dict[str, Any], generator_config: Optional[Dict[str, Any]], 
-                         model_name: str) -> str:
+                        model_name: str) -> str:
         module_type_mapping = {
             'openai_llm': 'openai',
             'llama_index_llm': 'llama_index',
             'vllm': 'vllm',
-            'vllm_api': 'vllm_api',
+            'sap_api': 'sap_api',
         }
-        
+
         if config.get('generator_module_type'):
             raw_module_type = config['generator_module_type']
             return module_type_mapping.get(raw_module_type, raw_module_type)
+
         elif generator_config and generator_config.get('module_type'):
             detected_module_type = generator_config.get('module_type')
             return module_type_mapping.get(detected_module_type, detected_module_type)
+
         else:
-            if 'gpt' in model_name.lower():
+            if any(x in model_name.lower() for x in ['gpt', 'o1-mini', 'o1-preview']):
                 return 'openai'
-            elif any(x in model_name.lower() for x in ['mistral', 'llama', 'qwen', 'mixtral']):
+
+            elif 'mistralai-large-instruct' in model_name:
+                return 'sap_api'
+ 
+            elif any(x in model_name.lower() for x in ['mistral', 'llama', 'qwen', 'mixtral', 'yi', 'gemma']):
                 return 'vllm'
+
             else:
                 return 'llama_index'
+            
+    @staticmethod
+    def convert_numpy_types(obj):
+        if isinstance(obj, pd.DataFrame):
+            return None
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                converted = Utils.convert_numpy_types(v)
+                if converted is not None:
+                    result[k] = converted
+            return result
+        elif isinstance(obj, list):
+            result = []
+            for item in obj:
+                converted = Utils.convert_numpy_types(item)
+                if converted is not None:
+                    result.append(converted)
+            return result
+        else:
+            return obj
+        
+    @staticmethod
+    def save_component_optimization_results(result_dir: str, results: Dict[str, Any], 
+                                           config_generator=None):
+        summary_file = os.path.join(result_dir, "component_optimization_summary.json")
+        results_serializable = Utils.convert_numpy_types(results)
+        
+        with open(summary_file, 'w') as f:
+            json.dump(results_serializable, f, indent=2)
+        
+        if config_generator and not results.get('validation_failed', False):
+            final_config = {}
+            for component in results.get('component_order', []):
+                if component in results.get('best_configs', {}) and results['best_configs'][component]:
+                    final_config.update(results['best_configs'][component])
+            
+            if final_config:
+                final_config_file = os.path.join(result_dir, "final_best_config.yaml")
+                final_config_serializable = Utils.convert_numpy_types(final_config)
+                with open(final_config_file, 'w') as f:
+                    yaml.dump(config_generator.generate_trial_config(final_config_serializable), f)
+                    
+    @staticmethod
+    def find_best_trial_from_component(component_trials: List[Dict], 
+                                    component: str = None) -> Optional[Dict]:
+        if not component_trials:
+            return None
+        
+        valid_trials = []
+        for trial in component_trials:
+            if 'status' in trial:
+                if trial.get('status') != 'FAILED':
+                    valid_trials.append(trial)
+            else:
+                valid_trials.append(trial)
+        
+        if not valid_trials:
+            return None
+        
+        score_groups = {}
+        for trial in valid_trials:
+            score = trial.get('score', 0.0)
+            if score not in score_groups:
+                score_groups[score] = []
+            score_groups[score].append(trial)
+        
+        if not score_groups:
+            return None
+        
+        max_score = max(score_groups.keys())
+        trials_with_max_score = score_groups[max_score]
+        
+        if len(trials_with_max_score) > 1:
+            if component:
+                print(f"[{component}] Found {len(trials_with_max_score)} trials with score {max_score:.4f}, selecting by latency")
+            best_trial = min(trials_with_max_score, key=lambda t: t.get('latency', float('inf')))
+            if component:
+                print(f"[{component}] Selected trial {best_trial.get('trial_number', 'unknown')} with latency {best_trial.get('latency', 0.0):.2f}s")
+        else:
+            best_trial = trials_with_max_score[0]
+            if component:
+                print(f"[{component}] Selected trial {best_trial.get('trial_number', 'unknown')} with score {max_score:.4f} and latency {best_trial.get('latency', 0.0):.2f}s")
+
+        if component:
+            print(f"[{component}] Best config: {best_trial.get('config', {})}")
+
+        return best_trial

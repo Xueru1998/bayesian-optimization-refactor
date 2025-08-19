@@ -6,6 +6,7 @@ from pipeline_component.token_evaluation import TokenEvaluatorModule
 from pipeline_component.generation_evaluator import GenerationEvaluatorModule
 from pipeline_component.ragas_evaluator import RagasEvaluatorModule
 from pipeline_component.llm_evaluator import CompressorLLMEvaluator
+from pipeline_component.generator import create_generator
 from pipeline.config_manager import ConfigGenerator
 from pipeline.utils import Utils
 
@@ -25,8 +26,8 @@ class RAGPipelineEvaluator:
         generation_weight: float = 0.5,
         use_ragas: bool = False, 
         ragas_config: Optional[Dict[str, Any]] = None,
-        use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_model: str = "gpt-4o",
+        use_llm_evaluator: bool = False,  
+        llm_evaluator_config: Optional[Dict[str, Any]] = None 
     ):
         self.config_generator = config_generator
         self.retrieval_metrics = retrieval_metrics
@@ -42,6 +43,15 @@ class RAGPipelineEvaluator:
         self.use_ragas = use_ragas
         self.ragas_config = ragas_config or {}
         
+        self.use_llm_evaluator = use_llm_evaluator
+        self.llm_evaluator_config = llm_evaluator_config or {}
+        
+        if self.use_llm_evaluator:
+            self.llm_compressor_evaluator = CompressorLLMEvaluator(
+                llm_model=self.llm_evaluator_config.get("llm_model", "gpt-4o"),
+                temperature=self.llm_evaluator_config.get("temperature", 0.0)
+            )
+            
         if self.use_ragas:
             self.ragas_evaluator = RagasEvaluatorModule(
                 retrieval_metrics=self.ragas_config.get('retrieval_metrics', ["context_precision", "context_recall"]),
@@ -49,14 +59,6 @@ class RAGPipelineEvaluator:
                     ["answer_relevancy", "faithfulness", "factual_correctness", "semantic_similarity"]), 
                 llm_model=self.ragas_config.get('llm_model', "gpt-4o-mini"),
                 embedding_model=self.ragas_config.get('embedding_model', "text-embedding-ada-002")
-            )
-        self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
-        self.llm_evaluator_model = llm_evaluator_model
-        
-        if self.use_llm_compressor_evaluator:
-            self.compressor_llm_evaluator = CompressorLLMEvaluator(
-                llm_model=self.llm_evaluator_model,
-                temperature=0.0
             )
     
     def evaluate_with_ragas(self, eval_df: pd.DataFrame, qa_subset: pd.DataFrame, 
@@ -129,12 +131,13 @@ class RAGPipelineEvaluator:
         filter_results = retrieval_evaluator.evaluate(filtered_ids, ground_truths)
         return filter_results
     
+    
     def evaluate_compressor(self, compressed_df: pd.DataFrame, qa_subset: pd.DataFrame) -> Dict[str, Any]:
-        if self.use_llm_compressor_evaluator: 
+        if self.use_llm_evaluator:
             print(f"[DEBUG] Evaluating compressor using LLM evaluator")
             
             batch_size = 5
-            scored_df = self.compressor_llm_evaluator.evaluate_batch(
+            scored_df = self.llm_compressor_evaluator.evaluate_batch(
                 df=compressed_df, 
                 qa_df=qa_subset,
                 context_col="retrieved_contents",
@@ -142,31 +145,18 @@ class RAGPipelineEvaluator:
                 batch_size=batch_size
             )
             
+            mean_score = scored_df["compressor_llm_score"].mean()
             scores_list = scored_df["compressor_llm_score"].tolist()
             
-            numeric_scores = []
-            for score in scores_list:
-                if isinstance(score, str):
-                    try:
-                        numeric_scores.append(float(score))
-                    except (ValueError, TypeError):
-                        print(f"[WARNING] Could not convert score to float: {score}")
-                        numeric_scores.append(0.0)
-                else:
-                    numeric_scores.append(float(score))
-            
-            mean_score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
-            
-            compressed_df["compressor_score"] = numeric_scores
+            compressed_df["compressor_score"] = scored_df["compressor_llm_score"]
             
             return {
-                "mean_score": mean_score,
-                "compressor_score": mean_score,  
-                "compressor_llm_score": mean_score,
-                "scores": numeric_scores,  
+                "mean_score": mean_score, 
+                "compressor_llm_score": mean_score, 
+                "scores": scores_list,
                 "compression_metrics": {
                     "llm_mean_score": mean_score,
-                    "llm_scores": numeric_scores,  
+                    "llm_scores": scores_list,
                     "evaluation_method": "llm_batch",
                     "batch_size": batch_size
                 }
@@ -178,6 +168,7 @@ class RAGPipelineEvaluator:
         token_evaluator = TokenEvaluatorModule(metrics=self.compressor_metrics)
         token_eval_results = token_evaluator.evaluate_from_dataframe(compressed_df, qa_subset)
         return token_eval_results
+
     
     def evaluate_generation(self, eval_df: pd.DataFrame, qa_subset: pd.DataFrame) -> Dict[str, Any]:
         embedding_model_name = None

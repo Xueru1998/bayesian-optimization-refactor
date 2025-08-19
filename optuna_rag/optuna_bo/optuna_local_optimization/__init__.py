@@ -1,3 +1,11 @@
-from .componentwise_optuna_optimizer import ComponentwiseOptunaOptimizer
+from .optimizers.componentwise_bayesian_optimization import ComponentwiseOptunaOptimizer
 
-__all__ = ['ComponentwiseOptunaOptimizer']
+# Create aliases for backward compatibility and different naming conventions
+ComponentwiseOptimizer = ComponentwiseOptunaOptimizer
+ComponentwiseOptunaOptimizer = ComponentwiseOptunaOptimizer
+
+__all__ = [
+    'ComponentwiseBayesianOptimizer',
+    'ComponentwiseOptimizer', 
+    'ComponentwiseOptunaOptimizer'
+]

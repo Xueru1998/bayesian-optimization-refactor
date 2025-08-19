@@ -7,7 +7,7 @@ from typing import Dict, Any, Union, Tuple
 
 class OptunaObjective:
     def __init__(self, search_space, config_generator, pipeline_runner, 
-                 component_cache, corpus_df, qa_df, use_cache=True, search_type='grid'):
+                 component_cache, corpus_df, qa_df, use_cache=True):
         self.search_space = search_space
         self.config_generator = config_generator
         self.pipeline_runner = pipeline_runner
@@ -15,14 +15,10 @@ class OptunaObjective:
         self.corpus_df = corpus_df
         self.qa_df = qa_df
         self.use_cache = use_cache
-        self.search_type = search_type
         self.cached_pipeline_runner = None
         
         self.has_query_expansion = self.config_generator.node_exists("query_expansion")
         self.has_retrieval = self.config_generator.node_exists("retrieval")
-        
-        if self.search_type == 'grid' and self.has_query_expansion:
-            self._precompute_valid_param_combinations()
     
     def _precompute_valid_param_combinations(self):
         self.valid_param_combinations = []
@@ -202,16 +198,8 @@ class OptunaObjective:
     
     
     def __call__(self, trial: optuna.Trial) -> float:
-        if self.search_type == 'grid' and self.has_query_expansion:
-            if trial.number < len(self.valid_param_combinations):
-                params = self.valid_param_combinations[trial.number].copy()
-                for key, value in params.items():
-                    trial._cached_frozen_trial.distributions[key] = optuna.distributions.CategoricalDistribution([value])
-                    trial._cached_frozen_trial.params[key] = value
-            else:
-                return 0.0
-        else:
-            params = self._suggest_params(trial)
+
+        params = self._suggest_params(trial)
         
         print(f"\nRunning trial {trial.number} with params: {params}")
         
@@ -392,7 +380,7 @@ class OptunaObjective:
             print(f"  Auto-setting filter to 'pass' because reranker_top_k=1")
             return
         
-        if self.search_type == 'bo' and 'passage_filter_method' in self.search_space:
+        if 'passage_filter_method' in self.search_space:
             params['passage_filter_method'] = trial.suggest_categorical(
                 'passage_filter_method', 
                 self.search_space['passage_filter_method']
@@ -475,7 +463,7 @@ class OptunaObjective:
                                                                 self.search_space['reranker_config'])
             
             if 'reranker_top_k' in self.search_space:
-                if self.search_type == 'bo' and 'retriever_top_k' in params:
+                if 'retriever_top_k' in params:
                     reranker_range = self.search_space['reranker_top_k']
                     if isinstance(reranker_range, tuple):
                         max_reranker_k = min(reranker_range[1], params['retriever_top_k'])
@@ -516,7 +504,7 @@ class OptunaObjective:
                                                                 self.search_space[model_key])
             
         if 'reranker_top_k' in self.search_space:
-            if self.search_type == 'bo' and 'retriever_top_k' in params:
+            if 'retriever_top_k' in params:
                 reranker_range = self.search_space['reranker_top_k']
                 if isinstance(reranker_range, tuple):
                     max_reranker_k = min(reranker_range[1], params['retriever_top_k'])
@@ -686,28 +674,8 @@ class OptunaObjective:
         )
         retrieval_module.prepare_project_dir(trial_dir, self.corpus_df, self.qa_df)
         
-        if self.search_type == 'grid':
-            from optuna_rag.cached_rag_pipeline_runner import CachedRAGPipelineRunner
-            
-            if self.cached_pipeline_runner is None:
-                self.cached_pipeline_runner = CachedRAGPipelineRunner(
-                    config_generator=self.config_generator,
-                    retrieval_metrics=self.pipeline_runner.retrieval_metrics,
-                    filter_metrics=self.pipeline_runner.filter_metrics,
-                    compressor_metrics=self.pipeline_runner.compressor_metrics,
-                    generation_metrics=self.pipeline_runner.generation_metrics,
-                    prompt_maker_metrics=self.pipeline_runner.prompt_maker_metrics,
-                    query_expansion_metrics=self.pipeline_runner.query_expansion_metrics,
-                    reranker_metrics=self.pipeline_runner.reranker_metrics,
-                    retrieval_weight=self.pipeline_runner.retrieval_weight,
-                    generation_weight=self.pipeline_runner.generation_weight,
-                    json_manager=None,
-                    cache_manager=self.component_cache if self.use_cache else None
-                )
-            
-            results = self.cached_pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
-        else:
-            results = self.pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
+
+        results = self.pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
         
         execution_time = time.time() - trial_start_time
         trial.set_user_attr('execution_time', execution_time)

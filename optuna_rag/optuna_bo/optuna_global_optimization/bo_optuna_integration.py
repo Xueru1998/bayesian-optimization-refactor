@@ -11,9 +11,8 @@ import logging
 from dotenv import load_dotenv
 
 import optuna
-from optuna.integration.wandb import WeightsAndBiasesCallback
 import wandb
-from plot_generator import PlotGenerator
+from optuna_rag.optuna_bo.optuna_global_optimization.plot_generator import PlotGenerator
 
 load_dotenv()
 
@@ -23,7 +22,7 @@ from pipeline.config_manager import ConfigGenerator
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor
-from optuna_rag.objective import OptunaObjective
+from optuna_rag.optuna_bo.optuna_global_optimization.objective import OptunaObjective
 from pipeline.wandb_logger import WandBLogger
 from pipeline.search_space_calculator import SearchSpaceCalculator
 
@@ -279,7 +278,6 @@ class BOPipelineOptimizer:
                 corpus_df=self.corpus_df,
                 qa_df=self.qa_df,
                 use_cache=False,
-                search_type='bo'
             )
 
             score = objective_instance(trial)

@@ -8,7 +8,7 @@ from pipeline.config_manager import ConfigGenerator
 from pipeline.pipeline_executor import RAGPipelineExecutor
 from pipeline.pipeline_evaluator import RAGPipelineEvaluator
 from pipeline.utils import Utils                        
-from pipeline_component.sap_embeddings import SAPEmbedding
+from pipeline_component.embedding.sap_embeddings import SAPEmbedding
 
 
 class EarlyStoppingException(Exception):
@@ -91,7 +91,7 @@ class RAGPipelineRunner:
             vectordb_name = config.get('vectordb_name', 'default')
             
             try:
-                from pipeline_component.retrieval import RetrievalModule
+                from pipeline_component.nodes.retrieval import RetrievalModule
                 
                 retrieval_module = RetrievalModule(
                     base_project_dir=trial_dir,

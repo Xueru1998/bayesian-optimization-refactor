@@ -14,7 +14,7 @@ from .componentwise_grid_search import ComponentwiseGridSearch
 from ..helpers.component_grid_search_helper import ComponentGridSearchHelper
 from ..helpers.config_cache_manager import ConfigCacheManager
 from pipeline.utils import Utils
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 
 
 class ComponentwiseOptunaOptimizer(BaseComponentwiseOptimizer):

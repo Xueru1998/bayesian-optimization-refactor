@@ -1,12 +1,11 @@
 import pandas as pd
 from typing import Dict, Any, List, Optional
 
-from pipeline_component.evaluation import EvaluationModule
-from pipeline_component.token_evaluation import TokenEvaluatorModule
-from pipeline_component.generation_evaluator import GenerationEvaluatorModule
-from pipeline_component.ragas_evaluator import RagasEvaluatorModule
-from pipeline_component.llm_evaluator import CompressorLLMEvaluator
-from pipeline_component.generator import create_generator
+from pipeline_component.evaluation.retrieval_evaluation import EvaluationModule
+from pipeline_component.evaluation.token_evaluation import TokenEvaluatorModule
+from pipeline_component.evaluation.generation_evaluator import GenerationEvaluatorModule
+from pipeline_component.evaluation.ragas_evaluator import RagasEvaluatorModule
+from pipeline_component.evaluation.llm_evaluator import CompressorLLMEvaluator
 from pipeline.config_manager import ConfigGenerator
 from pipeline.utils import Utils
 

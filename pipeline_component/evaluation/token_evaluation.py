@@ -26,7 +26,7 @@ class TokenEvaluatorModule:
         
         self.corpus_path = os.path.abspath(os.path.join(
             os.path.dirname(__file__), 
-            "..", 
+            "../..", 
             "autorag_project", 
             "corpus.parquet"
         ))

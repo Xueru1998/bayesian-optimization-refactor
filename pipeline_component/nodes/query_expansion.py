@@ -12,7 +12,7 @@ class BaseQueryExpansion(ABC):
     def __init__(self, project_dir: Union[str, Path], **kwargs):
         logger.info(f"Initialize query expansion node - {self.__class__.__name__} module...")
         
-        from pipeline_component.generator import make_generator_callable_param
+        from pipeline_component.nodes.generator import make_generator_callable_param
         
         generator_class, generator_params = make_generator_callable_param(kwargs)
         self.generator = generator_class(project_dir, **generator_params)

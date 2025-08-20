@@ -14,7 +14,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import spacy
 
-from pipeline_component.generator import make_generator_callable_param
+from pipeline_component.nodes.generator import make_generator_callable_param
 
 
 try:

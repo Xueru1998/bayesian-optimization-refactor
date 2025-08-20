@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 from ..base.base_componentwise_optimizer import BaseComponentwiseOptimizer
 from ..helpers.component_grid_search_helper import ComponentGridSearchHelper
 from pipeline.utils import Utils
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 
 
 class ComponentwiseGridSearch(BaseComponentwiseOptimizer):

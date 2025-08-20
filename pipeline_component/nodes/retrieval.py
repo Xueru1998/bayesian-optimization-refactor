@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Dict, Any, List, Union, Optional
 
 from autorag.nodes.retrieval.bm25 import BM25
+from autorag.nodes.retrieval.vectordb import VectorDB
 import yaml
 
-from .embedding_manager import EmbeddingManager
+from ..embedding.embedding_manager import EmbeddingManager
 from pipeline.utils import Utils
-from .sap_embeddings import SAPVectorDB, load_sap_vectordb_from_yaml
+from ..embedding.sap_embeddings import SAPVectorDB, load_sap_vectordb_from_yaml
 
 
 class RetrievalModule:
@@ -20,7 +21,7 @@ class RetrievalModule:
         self.use_pregenerated_embeddings = use_pregenerated_embeddings
         
         if centralized_project_dir:
-            print(f"Using provided centralized_project_dir: {centralized_project_dir}")
+            print(f"Using provided project_dir: {centralized_project_dir}")
             self.centralized_project_dir = centralized_project_dir
         else:
             project_root = Utils.find_project_root()
@@ -86,11 +87,9 @@ class RetrievalModule:
         embedding_model = target_config.get('embedding_model', '')
         
         if self._is_sap_embedding_url(embedding_model):
-            print(f"Using SAP API for embeddings: {vectordb_name}")
             return SAPVectorDB(project_dir=self.centralized_project_dir, vectordb=vectordb_name)
         else:
             print(f"Using standard AutoRAG VectorDB: {vectordb_name}")
-            from autorag.nodes.retrieval.vectordb import VectorDB
             return VectorDB(project_dir=self.centralized_project_dir, vectordb=vectordb_name)
     
     async def generate_vectordb_embeddings_sap(self, corpus_df: pd.DataFrame, vectordb_name: str, trial_dir: str):
@@ -527,7 +526,7 @@ class RetrievalModule:
         
         if self._is_sap_embedding_url(embedding_model):
             try:
-                from pipeline_component.sap_embeddings import load_sap_vectordb_from_yaml
+                from pipeline_component.embedding.sap_embeddings import load_sap_vectordb_from_yaml
                 
                 vectordb_yaml_path = os.path.join(trial_dir, "resources", "vectordb.yaml")
                 if not os.path.exists(vectordb_yaml_path):
@@ -584,7 +583,7 @@ class RetrievalModule:
         print(f"[Retrieval] Corpus has {len(corpus_df)} documents")
         
         try:
-            from pipeline_component.sap_embeddings import load_sap_vectordb_from_yaml
+            from pipeline_component.embedding.sap_embeddings import load_sap_vectordb_from_yaml
             
             vectordb = load_sap_vectordb_from_yaml(
                 vectordb_yaml_path, vectordb_name, self.centralized_project_dir

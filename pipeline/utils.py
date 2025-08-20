@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Union, Optional
 
 import yaml
 
-from pipeline_component.generator import create_generator
+from pipeline_component.nodes.generator import create_generator
 
 
 class NumpyEncoder(json.JSONEncoder):

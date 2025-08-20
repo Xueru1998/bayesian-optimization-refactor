@@ -21,7 +21,7 @@ from pipeline.config_manager import ConfigGenerator
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
 from smac3.local_optimization.componentwise_config_space_builder import ComponentwiseSMACConfigSpaceBuilder
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 from smac3.local_optimization.componentwise_rag_processor import ComponentwiseRAGProcessor
 
 
@@ -250,11 +250,6 @@ class ComponentwiseSMACOptimizer:
         os.makedirs(trial_component_dir, exist_ok=True)
         
         fixed_config = self.rag_processor.get_fixed_config(component, self.best_configs, self.COMPONENT_ORDER)
-        
-        if self.use_wandb:
-            WandBLogger.log_component_optimization_start(
-                component, component_idx, len(active_components), fixed_config
-            )
         
         cs = self.config_space_builder.build_component_space(component, fixed_config)
         

@@ -5,7 +5,7 @@ import argparse
 import pandas as pd
 from typing import Optional
 from pipeline.utils import Utils
-from pipeline.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
+from pipeline.logging.email.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
 
 
 class UnifiedSMACRunner:

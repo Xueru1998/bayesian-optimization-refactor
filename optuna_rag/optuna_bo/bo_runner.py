@@ -8,7 +8,7 @@ import wandb
 from pipeline.utils import Utils
 from optuna_rag.optuna_bo.optuna_global_optimization.bo_optuna_integration import BOPipelineOptimizer
 from optuna_rag.optuna_bo.optuna_local_optimization.componentwise_optuna_optimizer import ComponentwiseOptunaOptimizer
-from pipeline.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
+from pipeline.logging.email.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
 
 
 class UnifiedOptunaRunner:

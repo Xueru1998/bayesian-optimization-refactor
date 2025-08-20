@@ -663,7 +663,7 @@ class OptunaObjective:
     
     def _run_trial(self, trial: optuna.Trial, params: Dict[str, Any], trial_dir: str) -> float:
         import time
-        from pipeline_component.retrieval import RetrievalModule
+        from pipeline_component.nodes.retrieval import RetrievalModule
         
         trial_start_time = time.time()
         

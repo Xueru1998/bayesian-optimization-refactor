@@ -6,7 +6,7 @@ import json
 import numpy as np
 from typing import Dict, Any, List, Union, Optional
 
-from pipeline_component.generator import create_generator
+from pipeline_component.nodes.generator import create_generator
 
 
 class NumpyEncoder(json.JSONEncoder):

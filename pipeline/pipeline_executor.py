@@ -5,13 +5,13 @@ import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
 from autorag.nodes.retrieval.bm25 import get_bm25_pkl_name, bm25_ingest
-from pipeline_component.query_expansion import QueryExpansionModule
-from pipeline_component.retrieval import RetrievalModule
-from pipeline_component.passagefilter import PassageFilterModule
-from pipeline_component.passagecompressor import PassageCompressorModule
-from pipeline_component.promptmaker import PromptMakerModule
-from pipeline_component.generator import create_generator
-from pipeline_component.passageReranker import PassageRerankerModule
+from pipeline_component.nodes.query_expansion import QueryExpansionModule
+from pipeline_component.nodes.retrieval import RetrievalModule
+from pipeline_component.nodes.passagefilter import PassageFilterModule
+from pipeline_component.nodes.passagecompressor import PassageCompressorModule
+from pipeline_component.nodes.promptmaker import PromptMakerModule
+from pipeline_component.nodes.generator import create_generator
+from pipeline_component.nodes.passageReranker import PassageRerankerModule
 from pipeline.config_manager import ConfigGenerator
 from pipeline.config_manager import NodeDefaults
 from pipeline.utils import Utils

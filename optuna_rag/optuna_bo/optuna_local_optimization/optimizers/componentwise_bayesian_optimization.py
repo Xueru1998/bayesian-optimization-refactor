@@ -10,7 +10,7 @@ from optuna.integration import BoTorchSampler
 import wandb
 
 from ..base.base_componentwise_optimizer import BaseComponentwiseOptimizer
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 
 
 class ComponentwiseBayesianOptimization(BaseComponentwiseOptimizer):
@@ -167,11 +167,6 @@ class ComponentwiseBayesianOptimization(BaseComponentwiseOptimizer):
         os.makedirs(component_dir, exist_ok=True)
         
         fixed_config = self._get_fixed_config(component, active_components)
-        
-        if self.use_wandb:
-            WandBLogger.log_component_optimization_start(
-                component, component_idx, len(active_components), fixed_config
-            )
         
         search_space = self.search_space_builder.build_component_search_space(component, fixed_config)
         

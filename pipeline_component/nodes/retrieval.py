@@ -10,7 +10,7 @@ from autorag.nodes.retrieval.bm25 import BM25
 from autorag.nodes.retrieval.vectordb import VectorDB
 import yaml
 
-from .embedding_manager import EmbeddingManager
+from ..embedding.embedding_manager import EmbeddingManager
 from pipeline.utils import Utils
 
 

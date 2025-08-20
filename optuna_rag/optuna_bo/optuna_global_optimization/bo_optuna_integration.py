@@ -23,7 +23,7 @@ from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingExcepti
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from optuna_rag.optuna_bo.optuna_global_optimization.objective import OptunaObjective
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 from pipeline.search_space_calculator import SearchSpaceCalculator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

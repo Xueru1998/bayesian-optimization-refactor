@@ -21,7 +21,7 @@ from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingExcepti
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
 from smac3.global_optimization.config_space_builder import SMACConfigSpaceBuilder
-from pipeline.wandb_logger import WandBLogger
+from pipeline.logging.wandb import WandBLogger
 
 
 class SMACRAGOptimizer:

@@ -677,13 +677,13 @@ class OptunaObjective:
         
 
         if self.disable_early_stopping:
-            original_thresholds = self.pipeline_runner.early_stopping_thresholds
-            self.pipeline_runner.early_stopping_thresholds = None
+            original_thresholds = self.pipeline_runner.early_stopping_handler.early_stopping_thresholds
+            self.pipeline_runner.early_stopping_handler.early_stopping_thresholds = None
             
         results = self.pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
         
         if self.disable_early_stopping:
-            self.pipeline_runner.early_stopping_thresholds = original_thresholds
+            self.pipeline_runner.early_stopping_handler.early_stopping_thresholds = original_thresholds
         
         execution_time = time.time() - trial_start_time
         trial.set_user_attr('execution_time', execution_time)

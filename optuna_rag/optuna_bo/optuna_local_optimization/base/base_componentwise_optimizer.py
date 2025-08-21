@@ -5,13 +5,12 @@ import yaml
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple, Union
-import wandb
+
 
 from pipeline.config_manager import ConfigGenerator
 from pipeline.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
-from pipeline.wandb_logger import WandBLogger
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from ..helpers.component_pipeline_manager import ComponentPipelineManager
 from ..helpers.component_search_space_builder import ComponentSearchSpaceBuilder

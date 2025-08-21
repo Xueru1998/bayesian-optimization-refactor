@@ -7,7 +7,7 @@ from typing import Dict, Any, Union, Tuple
 
 class OptunaObjective:
     def __init__(self, search_space, config_generator, pipeline_runner, 
-                 component_cache, corpus_df, qa_df, use_cache=True):
+                 component_cache, corpus_df, qa_df, use_cache=True, disable_early_stopping=False):
         self.search_space = search_space
         self.config_generator = config_generator
         self.pipeline_runner = pipeline_runner
@@ -15,6 +15,7 @@ class OptunaObjective:
         self.corpus_df = corpus_df
         self.qa_df = qa_df
         self.use_cache = use_cache
+        self.disable_early_stopping = disable_early_stopping
         self.cached_pipeline_runner = None
         
         self.has_query_expansion = self.config_generator.node_exists("query_expansion")
@@ -675,7 +676,14 @@ class OptunaObjective:
         retrieval_module.prepare_project_dir(trial_dir, self.corpus_df, self.qa_df)
         
 
+        if self.disable_early_stopping:
+            original_thresholds = self.pipeline_runner.early_stopping_thresholds
+            self.pipeline_runner.early_stopping_thresholds = None
+            
         results = self.pipeline_runner.run_pipeline(params, trial_dir, self.qa_df)
+        
+        if self.disable_early_stopping:
+            self.pipeline_runner.early_stopping_thresholds = original_thresholds
         
         execution_time = time.time() - trial_start_time
         trial.set_user_attr('execution_time', execution_time)

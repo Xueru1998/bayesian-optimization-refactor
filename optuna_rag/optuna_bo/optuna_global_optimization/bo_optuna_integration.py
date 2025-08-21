@@ -249,14 +249,17 @@ class BOPipelineOptimizer:
         print("\n===== RAG Pipeline Optimizer Initialized =====")
         print(f"Using {self.n_trials} trials with {self.optimizer.upper()} sampler")
 
-        if self.component_early_stopping_enabled:
-            print(f"\nComponent-level early stopping ENABLED with thresholds:")
-            for component, threshold in self.component_early_stopping_thresholds.items():
-                print(f"  {component}: {threshold}")
+        if self.optimizer == "random":
+            print(f"\nNOTE: Early stopping is DISABLED for random sampler (both high-score and low-score)")
         else:
-            print(f"\nComponent-level early stopping DISABLED")
-        
-        print(f"\nHigh-score early stopping threshold: {self.early_stopping_threshold}")
+            if self.component_early_stopping_enabled:
+                print(f"\nComponent-level early stopping ENABLED with thresholds:")
+                for component, threshold in self.component_early_stopping_thresholds.items():
+                    print(f"  {component}: {threshold}")
+            else:
+                print(f"\nComponent-level early stopping DISABLED")
+            
+            print(f"\nHigh-score early stopping threshold: {self.early_stopping_threshold}")
         
         if self.use_ragas:
             print(f"\nEvaluation Method: RAGAS")
@@ -302,6 +305,8 @@ class BOPipelineOptimizer:
             early_stopped_score = None
             
             try:
+                disable_early_stopping = self.optimizer == "random"
+                
                 objective_instance = OptunaObjective(
                     search_space=self.search_space,
                     config_generator=self.config_generator,
@@ -310,6 +315,7 @@ class BOPipelineOptimizer:
                     corpus_df=self.corpus_df,
                     qa_df=self.qa_df,
                     use_cache=False,
+                    disable_early_stopping=disable_early_stopping,
                 )
 
                 score = objective_instance(trial)
@@ -700,7 +706,7 @@ class BOPipelineOptimizer:
                 study_name=self.study_name
             )
             
-            callbacks = [early_stopping]
+            callbacks = [early_stopping] if self.optimizer != "random" else []
             
             try:
                 study.optimize(
@@ -710,7 +716,7 @@ class BOPipelineOptimizer:
                     show_progress_bar=True
                 )
             except:
-                if early_stopping.should_stop:
+                if self.optimizer != "random" and early_stopping.should_stop:
                     print("Optimization stopped early due to achieving target score.")
                 else:
                     raise
@@ -784,7 +790,7 @@ class BOPipelineOptimizer:
                 "n_trials": len(self.all_trials),
                 "early_stopped_trials": early_stopped_count,
                 "completed_trials": len(self.all_trials) - early_stopped_count,
-                "early_stopped": early_stopping.should_stop,
+                "early_stopped": self.optimizer != "random" and early_stopping.should_stop,
                 "optimizer": self.optimizer,
                 "total_trials": len(self.all_trials),
                 "all_trials": self.all_trials,
@@ -809,7 +815,7 @@ class BOPipelineOptimizer:
                 wandb.summary["early_stopped_trials"] = early_stopped_count
                 wandb.summary["completed_trials"] = len(self.all_trials) - early_stopped_count
                 wandb.summary["optimization_time"] = total_time
-                wandb.summary["early_stopped"] = early_stopping.should_stop
+                wandb.summary["early_stopped"] = self.optimizer != "random" and early_stopping.should_stop
                 wandb.summary["optimizer"] = self.optimizer
                 wandb.summary["evaluation_method"] = "RAGAS" if self.use_ragas else "Traditional"
                 

@@ -89,6 +89,9 @@ class RAGPipelineRunner:
         if is_local_optimization:
             return
         
+        if self.early_stopping_thresholds is None:
+            return
+        
         threshold = self.early_stopping_thresholds.get(component)
         if threshold is not None and score < threshold:
             print(f"\n[EARLY STOPPING] {component} score {score:.4f} < threshold {threshold}")

@@ -90,85 +90,6 @@ This framework provides both global and local optimization strategies for RAG sy
 - **Logging & Monitoring**: Integrated W&B logging and email notifications
 - **Flexible Pipeline**: Modular design for easy customization and extension
 
-## Project Structure
-
-```
-optuna_rag/
-├── optuna_bo/
-│   ├── optuna_global_optimization/
-│   │   ├── bo_optuna_integration.py
-│   │   ├── objective.py
-│   │   └── plot_generator.py
-│   ├── optuna_local_optimization/
-│   │   ├── base/
-│   │   │   ├── __init__.py
-│   │   │   └── base_componentwise_optimizer.py
-│   │   ├── helpers/
-│   │   │   ├── __init__.py
-│   │   │   ├── component_grid_search_helper.py
-│   │   │   ├── component_pipeline_manager.py
-│   │   │   └── component_search_space_builder.py
-│   │   ├── optimizers/
-│   │   │   ├── componentwise_bayesian_optimization.py
-│   │   │   └── componentwise_grid_search.py
-│   │   ├── __init__.py
-│   │   └── componentwise_optuna_optimizer.py
-│   ├── __init__.py
-│   └── bo_runner.py
-
-pipeline/
-├── logging/
-│   ├── email/
-│   │   ├── __init__.py
-│   │   └── email_notifier.py
-│   └── wandb/
-│       ├── __init__.py
-│       ├── core.py
-│       ├── metrics.py
-│       ├── tables.py
-│       ├── utils.py
-│       └── visualization.py
-├── config_manager.py
-├── pipeline_evaluator.py
-├── pipeline_executor.py
-├── rag_pipeline_runner.py
-├── search_space_calculator.py
-├── search_space_extractor.py
-└── utils.py
-
-pipeline_component/
-├── embedding/
-│   └── embedding_manager.py
-├── evaluation/
-│   ├── __init__.py
-│   ├── generation_evaluator.py
-│   ├── llm_evaluator.py
-│   ├── ragas_evaluator.py
-│   ├── retrieval_evaluation.py
-│   └── token_evaluation.py
-└── nodes/
-    ├── generator.py
-    ├── passagecompressor.py
-    ├── passagefilter.py
-    ├── passageReranker.py
-    ├── promptmaker.py
-    ├── query_expansion.py
-    └── retrieval.py
-
-smac3/
-├── global_optimization/
-│   ├── __init__.py
-│   ├── config_space_builder.py
-│   └── smac_rag_optimizer.py
-├── local_optimization/
-│   ├── __init__.py
-│   ├── componentwise_config_space_builder.py
-│   ├── componentwise_rag_processor.py
-│   └── componentwise_smac_rag_optimizer.py
-├── __init__.py
-└── smac_runner.py
-```
-
 ## Installation
 
 ```bash
@@ -193,7 +114,7 @@ pip install -r requirements.txt
 ### Optimization Strategies
 - **Global Optimization**: End-to-end pipeline optimization
 - **Local Optimization**: Component-wise optimization
-- **Bayesian Optimization**: Efficient hyperparameter search
+- **Random Search**: Randomly select configurations to explore
 - **Grid Search**: Exhaustive parameter exploration
 
 ## Logging and Monitoring

@@ -39,6 +39,8 @@ Optimizes the entire RAG pipeline end-to-end as a single objective function.
 
 ```bash
 python bo_runner.py --mode global --n_trials 50 --sampler tpe
+python bo_runner.py --mode global --n_trials 50 --sampler random (Random search does not have early stopping for bad configs)
+python bo_runner.py --mode global --n_trials 50 --sampler botorch
 ```
 
 **Best for:**
@@ -61,6 +63,8 @@ Optimizes each RAG component sequentially, using outputs from previous component
 
 ```bash
 python bo_runner.py --mode componentwise --n_trials_per_component 20 --sampler tpe
+python bo_runner.py --mode componentwise --n_trials_per_component 20 --sampler botorch
+python bo_runner.py --mode componentwise --n_trials_per_component 20 --sampler grid (grid search for all combinations in one component)
 ```
 
 **Best for:**
@@ -114,37 +118,6 @@ python bo_runner.py --mode componentwise --n_trials_per_component 20 --sampler t
 - **Use when**: You have small search spaces and want exhaustive coverage
 
 ## Command Line Interface
-
-### Quick Start Examples
-
-**Basic optimization:**
-```bash
-python bo_runner.py
-```
-
-**High-performance setup:**
-```bash
-python bo_runner.py \
-  --mode componentwise \
-  --sampler tpe \
-  --n_trials_per_component 20 \
-  --early_stopping_threshold 0.9 \
-```
-
-**Grid search for exhaustive exploration:**
-```bash
-python bo_runner.py \
-  --mode componentwise \
-  --sampler grid \
-```
-
-**Multi-objective optimization:**
-```bash
-python bo_runner.py \
-  --mode componentwise \
-  --sampler botorch \
-  --n_trials_per_component 20
-```
 
 ### Essential Parameters
 

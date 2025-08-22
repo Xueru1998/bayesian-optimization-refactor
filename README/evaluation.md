@@ -198,6 +198,7 @@ python bo_runner.py \
 - ✅ Limited API budget
 - ✅ Well-understood domains
 - ✅ Component-wise optimization
+- ⚠️ Important: For token evaluation in the compressor, in almost all cases, uncompressed text will have a higher score than compressed text. 
 
 ### Use RAGAS When:
 - ✅ End-to-end quality assessment needed
@@ -246,25 +247,3 @@ python bo_runner.py \
 5. **Budget Considerations**: Traditional metrics for exploration, LLM metrics for exploitation
 
 6. **Validation**: Always validate LLM-based scores with human evaluation on a sample
-
-## Troubleshooting
-
-**Low Traditional Metric Scores:**
-- Check ground truth data quality
-- Verify metric configuration in config.yaml
-- Ensure proper data preprocessing
-
-**RAGAS Evaluation Errors:**
-- Verify OpenAI API key configuration
-- Check internet connectivity
-- Ensure ground truth data completeness
-
-**LLM Compressor Evaluation Issues:**
-- Verify generation_gt column in validation data
-- Check LangChain OpenAI setup
-- Monitor API rate limits
-
-**Inconsistent Results:**
-- Traditional metrics should be identical across runs
-- LLM metrics may vary slightly; use temperature=0 for consistency
-- Check for data preprocessing differences

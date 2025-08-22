@@ -56,7 +56,9 @@ class SMACRAGOptimizer:
         use_ragas: bool = False,
         ragas_config: Optional[Dict[str, Any]] = None,
         use_llm_compressor_evaluator: bool = False,
-        llm_evaluator_config: Optional[Dict[str, Any]] = None
+        llm_evaluator_config: Optional[Dict[str, Any]] = None,
+        disable_early_stopping: bool = False,
+        early_stopping_thresholds: Optional[Dict[str, float]] = None
     ):
         print(f"[SMACRAGOptimizer] Initializing with:")
         print(f"  use_llm_compressor_evaluator: {use_llm_compressor_evaluator}")
@@ -73,7 +75,8 @@ class SMACRAGOptimizer:
             generation_weight, use_cached_embeddings, walltime_limit, n_workers,
             seed, early_stopping_threshold, optimizer, use_multi_fidelity,
             min_budget_percentage, max_budget_percentage, eta, use_ragas, ragas_config,
-            use_llm_compressor_evaluator, llm_evaluator_config
+            use_llm_compressor_evaluator, llm_evaluator_config, disable_early_stopping,
+            early_stopping_thresholds
         )
         self._initialize_wandb_params(use_wandb, wandb_project, wandb_entity, wandb_run_name)
         
@@ -111,11 +114,12 @@ class SMACRAGOptimizer:
         self.total_samples = len(qa_data)
     
     def _initialize_optimization_params(self, n_trials, sample_percentage, cpu_per_trial,
-                                  retrieval_weight, generation_weight, use_cached_embeddings,
-                                  walltime_limit, n_workers, seed, early_stopping_threshold,
-                                  optimizer, use_multi_fidelity, min_budget_percentage,
-                                  max_budget_percentage, eta, use_ragas, ragas_config,
-                                  use_llm_compressor_evaluator, llm_evaluator_config):
+                                retrieval_weight, generation_weight, use_cached_embeddings,
+                                walltime_limit, n_workers, seed, early_stopping_threshold,
+                                optimizer, use_multi_fidelity, min_budget_percentage,
+                                max_budget_percentage, eta, use_ragas, ragas_config,
+                                use_llm_compressor_evaluator, llm_evaluator_config,
+                                disable_early_stopping, early_stopping_thresholds):
         self.n_trials = n_trials
         self.sample_percentage = sample_percentage
         self.cpu_per_trial = cpu_per_trial
@@ -141,6 +145,18 @@ class SMACRAGOptimizer:
         self.ragas_config = ragas_config  
         self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
         self.llm_evaluator_config = llm_evaluator_config
+        
+        self.disable_early_stopping = disable_early_stopping
+        if self.disable_early_stopping:
+            self.early_stopping_thresholds = None
+        else:
+            self.early_stopping_thresholds = early_stopping_thresholds or {
+                'retrieval': 0.1,
+                'query_expansion': 0.1,
+                'reranker': 0.2,
+                'filter': 0.25,
+                'compressor': 0.3
+            }
         
     def _initialize_wandb_params(self, use_wandb, wandb_project, wandb_entity, wandb_run_name):
         self.use_wandb = use_wandb
@@ -196,7 +212,8 @@ class SMACRAGOptimizer:
             use_ragas=use_ragas,
             ragas_config=ragas_config,
             use_llm_evaluator=use_llm_evaluator,
-            llm_evaluator_config=llm_evaluator_config
+            llm_evaluator_config=llm_evaluator_config,
+            early_stopping_thresholds=self.early_stopping_thresholds
         )
     
     def _calculate_trials_if_needed(self):
@@ -1238,6 +1255,13 @@ class SMACRAGOptimizer:
             print(f"  Min budget: {self.min_budget} samples ({self.min_budget_percentage:.1%})")
             print(f"  Max budget: {self.max_budget} samples ({self.max_budget_percentage:.1%})")
             print(f"  Eta: {self.eta}")
+        
+        if not self.disable_early_stopping:
+            print("\nEarly stopping enabled with thresholds:")
+            for component, threshold in self.early_stopping_thresholds.items():
+                print(f"  {component}: < {threshold}")
+        else:
+            print("\nEarly stopping: DISABLED")
         
         for component, info in summary.items():
             if component not in ["search_space_size", "combination_note"] and info['combinations'] > 1:

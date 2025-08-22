@@ -123,14 +123,19 @@ class BOPipelineOptimizer:
         self.use_llm_compressor_evaluator = use_llm_compressor_evaluator
         self.llm_evaluator_config = llm_evaluator_config or {}
 
-        self.disable_early_stopping = disable_early_stopping
-        self.early_stopping_thresholds = early_stopping_thresholds or {
-            'retrieval': 0.1,
-            'query_expansion': 0.1,
-            'reranker': 0.2,
-            'filter': 0.25,
-            'compressor': 0.3
-        }
+        self.disable_early_stopping = disable_early_stopping or (optimizer == "random")
+        
+        if self.disable_early_stopping:
+            self.early_stopping_thresholds = None
+        else:
+            self.early_stopping_thresholds = early_stopping_thresholds or {
+                'retrieval': 0.1,
+                'query_expansion': 0.1,
+                'reranker': 0.2,
+                'filter': 0.25,
+                'compressor': 0.3
+            }
+        
         self.early_stopped_trials = [] 
         
         if ragas_metrics is None and use_ragas:
@@ -369,7 +374,7 @@ class BOPipelineOptimizer:
             'generation_weight': self.generation_weight,
             'use_llm_evaluator': self.use_llm_compressor_evaluator,
             'llm_evaluator_config': self.llm_evaluator_config,
-            'early_stopping_thresholds': self.early_stopping_thresholds if not self.disable_early_stopping else None
+            'early_stopping_thresholds': self.early_stopping_thresholds
         }
         
         if self.use_ragas:
@@ -830,7 +835,7 @@ class BOPipelineOptimizer:
                 study_name=self.study_name
             )
             
-            callbacks = [early_stopping]
+            callbacks = [early_stopping] if self.optimizer != "random" else []
             
             try:
                 study.optimize(

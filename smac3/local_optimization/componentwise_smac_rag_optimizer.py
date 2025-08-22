@@ -335,7 +335,6 @@ class ComponentwiseSMACOptimizer:
         
         full_config = {**fixed_components, **trial_config}
         
-        print(f"\n[DEBUG] Trial {self.current_trial + 1} config from SMAC: {dict(config)}")
         print(f"[DEBUG] Is pass component: {is_pass_component}")
         
         cleaned_config = self.config_space_builder.clean_trial_config(full_config)

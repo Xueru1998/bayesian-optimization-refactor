@@ -936,7 +936,11 @@ class RAGPipelineExecutor:
         elif 'ground_truth' in qa_subset.columns:
             eval_df['generation_gt'] = qa_subset['ground_truth'].values
             
-        eval_df['retrieved_contents'] = working_df['retrieved_contents'].values
+        if 'retrieved_contents' in working_df.columns:
+            eval_df['retrieved_contents'] = working_df['retrieved_contents'].values
+        else:
+            print("[WARNING] 'retrieved_contents' not found in working_df, using empty lists")
+            eval_df['retrieved_contents'] = [[] for _ in range(len(eval_df))]
         
         if 'prompts' in prompts_df.columns:
             eval_df['prompts'] = prompts_df['prompts'].values

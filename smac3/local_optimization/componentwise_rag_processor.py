@@ -320,47 +320,30 @@ class ComponentwiseRAGProcessor:
         return fixed_config
     
     def load_previous_outputs(self, component: str, qa_subset: pd.DataFrame, 
-                            component_dataframes: Dict[str, str], 
-                            trial_dir: str) -> pd.DataFrame:
+                        component_dataframes: Dict[str, str], 
+                        trial_dir: str) -> pd.DataFrame:
         prev_components = ['query_expansion', 'retrieval', 'passage_reranker', 
-                          'passage_filter', 'passage_compressor', 'prompt_maker_generator']
-        
-        best_output_loaded = False
+                        'passage_filter', 'passage_compressor', 'prompt_maker_generator']
         
         if component not in ['query_expansion', 'retrieval']:
-            if 'query_expansion' in component_dataframes:
-                print(f"[{component}] Using best query_expansion output (which includes retrieval)")
-                best_parquet_path = component_dataframes['query_expansion']
-                if os.path.exists(best_parquet_path):
-                    best_prev_df = pd.read_parquet(best_parquet_path)
-                    
-                    if len(best_prev_df) == len(qa_subset):
-                        for col in best_prev_df.columns:
-                            if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']:
-                                qa_subset[col] = best_prev_df[col]
-                        best_output_loaded = True
-
-                    trial_prev_path = os.path.join(trial_dir, "query_expansion_output.parquet")
-                    best_prev_df.to_parquet(trial_prev_path)
-            
-            if not best_output_loaded:
-                for prev_comp in reversed(prev_components[:prev_components.index(component)]):
-                    if prev_comp in component_dataframes:
-                        best_parquet_path = component_dataframes[prev_comp]
-                        if os.path.exists(best_parquet_path):
-                            print(f"[{component}] Using best {prev_comp} output from: {best_parquet_path}")
-                            best_prev_df = pd.read_parquet(best_parquet_path)
-                            print(f"[{component}] Loaded {prev_comp} output with columns: {list(best_prev_df.columns)}")
-                            
-                            if len(best_prev_df) == len(qa_subset):
-                                for col in best_prev_df.columns:
-                                    if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']:
-                                        qa_subset[col] = best_prev_df[col]
-                                print(f"[{component}] Merged columns from {prev_comp}: {[col for col in best_prev_df.columns if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']]}")
-                            
-                            trial_prev_path = os.path.join(trial_dir, f"{prev_comp}_output.parquet")
-                            best_prev_df.to_parquet(trial_prev_path)
-                            break
+            component_idx = prev_components.index(component)
+            for prev_comp in reversed(prev_components[:component_idx]):
+                if prev_comp in component_dataframes:
+                    best_parquet_path = component_dataframes[prev_comp]
+                    if os.path.exists(best_parquet_path):
+                        print(f"[{component}] Using best {prev_comp} output from: {best_parquet_path}")
+                        best_prev_df = pd.read_parquet(best_parquet_path)
+                        print(f"[{component}] Loaded {prev_comp} output with columns: {list(best_prev_df.columns)}")
+                        
+                        if len(best_prev_df) == len(qa_subset):
+                            for col in best_prev_df.columns:
+                                if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']:
+                                    qa_subset[col] = best_prev_df[col]
+                            print(f"[{component}] Merged columns from {prev_comp}: {[col for col in best_prev_df.columns if col not in ['query', 'retrieval_gt', 'generation_gt', 'qid']]}")
+                        
+                        trial_prev_path = os.path.join(trial_dir, f"{prev_comp}_output.parquet")
+                        best_prev_df.to_parquet(trial_prev_path)
+                        break  
         
         print(f"[{component}] Final qa_subset columns before pipeline run: {list(qa_subset.columns)}")
         return qa_subset
@@ -461,64 +444,14 @@ class ComponentwiseRAGProcessor:
         return score
     
     def save_component_output(self, component: str, trial_dir: str, 
-                        results: Dict[str, Any], qa_data: pd.DataFrame) -> str:
-    
+                    results: Dict[str, Any], qa_data: pd.DataFrame) -> str:
+
         output_df = qa_data.copy()
         
-        print(f"[{component}] Initial columns in qa_data: {list(qa_data.columns)}")
-
-        if component == 'query_expansion':
-            if 'retrieval_df' in results:
-                retrieval_df = results['retrieval_df']
-                if isinstance(retrieval_df, pd.DataFrame):
-                    for col in ['retrieved_ids', 'retrieved_contents', 'retrieve_scores']:
-                        if col in retrieval_df.columns:
-                            output_df[col] = retrieval_df[col]
-                    if 'queries' in retrieval_df.columns:
-                        output_df['queries'] = retrieval_df['queries']
-
-            for col in ['retrieved_ids', 'retrieved_contents', 'retrieve_scores', 'queries']:
-                if col in qa_data.columns and col not in output_df.columns:
-                    output_df[col] = qa_data[col]
-
-        elif component == 'retrieval':
-            retrieval_columns = ['retrieved_ids', 'retrieved_contents', 'retrieve_scores']
-            for col in retrieval_columns:
-                if col in qa_data.columns:
-                    output_df[col] = qa_data[col]
-                else:
-                    if col in results:
-                        output_df[col] = results[col]
-                    elif f'{col[:-1]}_list' in results:
-                        output_df[col] = results[f'{col[:-1]}_list']
-
-            if 'queries' in qa_data.columns:
-                output_df['queries'] = qa_data['queries']
-
-        elif component in ['passage_reranker', 'passage_filter', 'passage_compressor']:
-            base_columns = ['query', 'retrieval_gt', 'generation_gt', 'qid']
-            for col in qa_data.columns:
-                if col not in base_columns and col not in output_df.columns:
-                    output_df[col] = qa_data[col]
-
-            if component == 'passage_compressor' and 'compressor_score' in qa_data.columns:
-                output_df['compressor_score'] = qa_data['compressor_score']
-
-        elif component == 'prompt_maker_generator':
-            for col in qa_data.columns:
-                if col not in output_df.columns:
-                    output_df[col] = qa_data[col]
-
-            if 'eval_df' in results and isinstance(results['eval_df'], pd.DataFrame):
-                eval_df = results['eval_df']
-                for col in ['generated_texts', 'prompts']:
-                    if col in eval_df.columns:
-                        output_df[col] = eval_df[col]
+        print(f"[{component}] Saving output with {len(output_df)} rows")
         
         output_path = os.path.join(trial_dir, f"{component}_output.parquet")
         output_df.to_parquet(output_path)
-
-        print(f"[{component}] Saved output with columns: {list(output_df.columns)}")
         
         return output_path
     

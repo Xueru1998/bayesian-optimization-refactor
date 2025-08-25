@@ -157,79 +157,6 @@ class UnifiedSMACRunner:
             }
         return ragas_config
     
-    def _run_global_optimization(self, args, qa_df, corpus_df, config_template):
-        from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
-        
-        ragas_config = self._prepare_ragas_config(args)
-
-        optimizer = SMACRAGOptimizer(
-            config_template=config_template,
-            qa_data=qa_df,
-            corpus_data=corpus_df,
-            project_dir=args.project_dir,
-            n_trials=args.n_trials,
-            sample_percentage=args.sample_percentage,
-            cpu_per_trial=args.cpu_per_trial,
-            retrieval_weight=args.retrieval_weight,
-            generation_weight=args.generation_weight,
-            use_cached_embeddings=args.use_cached_embeddings,
-            result_dir=args.result_dir,
-            study_name=args.study_name,
-            walltime_limit=args.walltime_limit,
-            n_workers=args.n_workers,
-            seed=args.seed,
-            early_stopping_threshold=args.early_stopping_threshold,
-            use_wandb=not args.no_wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            wandb_run_name=args.wandb_run_name,
-            optimizer=args.optimizer,
-            use_multi_fidelity=args.use_multi_fidelity,
-            min_budget_percentage=args.min_budget_percentage,
-            max_budget_percentage=args.max_budget_percentage,
-            eta=args.eta,
-            use_ragas=args.use_ragas,
-            ragas_config=ragas_config,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
-        )
-        
-        return optimizer.optimize()
-
-    def _run_componentwise_optimization(self, args, qa_df, corpus_df, config_template):
-        from smac3.local_optimization.componentwise_smac_rag_optimizer import ComponentwiseSMACOptimizer
-
-        optimizer = ComponentwiseSMACOptimizer(
-            config_template=config_template,
-            qa_data=qa_df,
-            corpus_data=corpus_df,
-            project_dir=args.project_dir,
-            n_trials_per_component=args.n_trials,
-            sample_percentage=args.sample_percentage,
-            cpu_per_trial=args.cpu_per_trial,
-            retrieval_weight=args.retrieval_weight,
-            generation_weight=args.generation_weight,
-            use_cached_embeddings=args.use_cached_embeddings,
-            result_dir=args.result_dir,
-            study_name=args.study_name,
-            walltime_limit_per_component=args.walltime_limit,
-            n_workers=args.n_workers,
-            seed=args.seed,
-            early_stopping_threshold=args.early_stopping_threshold,
-            use_wandb=not args.no_wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            optimizer=args.optimizer,
-            use_multi_fidelity=args.use_multi_fidelity,
-            min_budget_percentage=args.min_budget_percentage,
-            max_budget_percentage=args.max_budget_percentage,
-            eta=args.eta,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
-        )
-        
-        return optimizer.optimize()
-    
     def run(self, argv=None) -> int:
         args = self.parser.parse_args(argv)
         
@@ -299,82 +226,78 @@ class UnifiedSMACRunner:
         start_time = time.time()
         
         print(f"\nStarting {args.optimization_mode} optimization...")
-        
-        
+
         if args.optimization_mode == 'componentwise':
-            if email_notifier:
-                from smac3.local_optimization.componentwise_smac_rag_optimizer import ComponentwiseSMACOptimizer
-                optimizer = ComponentwiseSMACOptimizer(
-                    config_template=config_template,
-                    qa_data=qa_df,
-                    corpus_data=corpus_df,
-                    project_dir=args.project_dir,
-                    n_trials_per_component=args.n_trials,
-                    sample_percentage=args.sample_percentage,
-                    cpu_per_trial=args.cpu_per_trial,
-                    retrieval_weight=args.retrieval_weight,
-                    generation_weight=args.generation_weight,
-                    use_cached_embeddings=args.use_cached_embeddings,
-                    result_dir=args.result_dir,
-                    study_name=args.study_name,
-                    walltime_limit_per_component=args.walltime_limit,
-                    n_workers=args.n_workers,
-                    seed=args.seed,
-                    early_stopping_threshold=args.early_stopping_threshold,
-                    use_wandb=not args.no_wandb,
-                    wandb_project=args.wandb_project,
-                    wandb_entity=args.wandb_entity,
-                    use_multi_fidelity=args.use_multi_fidelity,
-                    min_budget_percentage=args.min_budget_percentage,
-                    max_budget_percentage=args.max_budget_percentage,
-                    eta=args.eta,
-                    use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,  
-                    llm_evaluator_model=args.llm_evaluator_model 
-                )
-                wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
-                best_results = wrapper.run_with_notification(experiment_name=experiment_name)
-            else:
-                best_results = self._run_componentwise_optimization(args, qa_df, corpus_df, config_template)
+            from smac3.local_optimization.componentwise_optimizer import ComponentwiseSMACOptimizer
+            optimizer = ComponentwiseSMACOptimizer(
+                config_template=config_template,
+                qa_data=qa_df,
+                corpus_data=corpus_df,
+                project_dir=args.project_dir,
+                n_trials_per_component=args.n_trials,
+                sample_percentage=args.sample_percentage,
+                cpu_per_trial=args.cpu_per_trial,
+                retrieval_weight=args.retrieval_weight,
+                generation_weight=args.generation_weight,
+                use_cached_embeddings=args.use_cached_embeddings,
+                result_dir=args.result_dir,
+                study_name=args.study_name,
+                walltime_limit_per_component=args.walltime_limit,
+                n_workers=args.n_workers,
+                seed=args.seed,
+                early_stopping_threshold=args.early_stopping_threshold,
+                use_wandb=not args.no_wandb,
+                wandb_project=args.wandb_project,
+                wandb_entity=args.wandb_entity,
+                optimizer=args.optimizer,
+                use_multi_fidelity=args.use_multi_fidelity,
+                min_budget_percentage=args.min_budget_percentage,
+                max_budget_percentage=args.max_budget_percentage,
+                eta=args.eta,
+                use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
+                llm_evaluator_model=args.llm_evaluator_model
+            )
         else:
-            if email_notifier:
-                from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
-                ragas_config = self._prepare_ragas_config(args)
-                optimizer = SMACRAGOptimizer(
-                    config_template=config_template,
-                    qa_data=qa_df,
-                    corpus_data=corpus_df,
-                    project_dir=args.project_dir,
-                    n_trials=args.n_trials,
-                    sample_percentage=args.sample_percentage,
-                    cpu_per_trial=args.cpu_per_trial,
-                    retrieval_weight=args.retrieval_weight,
-                    generation_weight=args.generation_weight,
-                    use_cached_embeddings=args.use_cached_embeddings,
-                    result_dir=args.result_dir,
-                    study_name=args.study_name,
-                    walltime_limit=args.walltime_limit,
-                    n_workers=args.n_workers,
-                    seed=args.seed,
-                    early_stopping_threshold=args.early_stopping_threshold,
-                    use_wandb=not args.no_wandb,
-                    wandb_project=args.wandb_project,
-                    wandb_entity=args.wandb_entity,
-                    wandb_run_name=args.wandb_run_name,
-                    optimizer=args.optimizer,
-                    use_multi_fidelity=args.use_multi_fidelity,
-                    min_budget_percentage=args.min_budget_percentage,
-                    max_budget_percentage=args.max_budget_percentage,
-                    eta=args.eta,
-                    use_ragas=args.use_ragas,
-                    ragas_config=ragas_config,
-                    use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,  
-                    llm_evaluator_model=args.llm_evaluator_model 
-                )
-                wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
-                best_results = wrapper.run_with_notification(experiment_name=experiment_name)
-            else:
-                best_results = self._run_global_optimization(args, qa_df, corpus_df, config_template)
-                
+            from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
+            ragas_config = self._prepare_ragas_config(args)
+            optimizer = SMACRAGOptimizer(
+                config_template=config_template,
+                qa_data=qa_df,
+                corpus_data=corpus_df,
+                project_dir=args.project_dir,
+                n_trials=args.n_trials,
+                sample_percentage=args.sample_percentage,
+                cpu_per_trial=args.cpu_per_trial,
+                retrieval_weight=args.retrieval_weight,
+                generation_weight=args.generation_weight,
+                use_cached_embeddings=args.use_cached_embeddings,
+                result_dir=args.result_dir,
+                study_name=args.study_name,
+                walltime_limit=args.walltime_limit,
+                n_workers=args.n_workers,
+                seed=args.seed,
+                early_stopping_threshold=args.early_stopping_threshold,
+                use_wandb=not args.no_wandb,
+                wandb_project=args.wandb_project,
+                wandb_entity=args.wandb_entity,
+                wandb_run_name=args.wandb_run_name,
+                optimizer=args.optimizer,
+                use_multi_fidelity=args.use_multi_fidelity,
+                min_budget_percentage=args.min_budget_percentage,
+                max_budget_percentage=args.max_budget_percentage,
+                eta=args.eta,
+                use_ragas=args.use_ragas,
+                ragas_config=ragas_config,
+                use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
+                llm_evaluator_model=args.llm_evaluator_model
+            )
+
+        if email_notifier:
+            wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
+            best_results = wrapper.run_with_notification(experiment_name=experiment_name)
+        else:
+            best_results = optimizer.optimize()
+            
         end_time = time.time()
         total_time = end_time - start_time
         hours, remainder = divmod(total_time, 3600)

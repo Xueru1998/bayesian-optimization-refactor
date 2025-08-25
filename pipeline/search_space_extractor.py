@@ -290,16 +290,32 @@ class UnifiedSearchSpaceExtractor:
                 'metadata': option_metadata
             }
 
+        compression_ratios = []
+        applicable_methods = []
+        
+        for comp_config in params.get('compressor_configs', []):
+            method = comp_config['method']
+            if method in ['lexrank', 'spacy', 'sentence_rank', 'keyword_extraction', 'query_focused']:
+                if 'compression_ratio' in comp_config:
+                    compression_ratios.extend(comp_config['compression_ratio'])
+                    if method == 'spacy':
+                        for model in comp_config.get('spacy_model', ['en_core_web_sm']):
+                            applicable_methods.append(f"{method}::{model}")
+                    else:
+                        applicable_methods.append(method)
+        
+        if compression_ratios:
+            unique_ratios = list(dict.fromkeys(compression_ratios))
+            space['compression_ratio'] = {
+                'type': 'float',
+                'values': unique_ratios,
+                'condition': ('passage_compressor_config', 'in', applicable_methods)
+            }
+
         for comp_config in params.get('compressor_configs', []):
             method = comp_config['method']
 
             if method == 'lexrank':
-                if 'compression_ratio' in comp_config:
-                    space['lexrank_compression_ratio'] = {
-                        'type': 'float',
-                        'values': comp_config['compression_ratio'],
-                        'condition': ('passage_compressor_config', 'equals', 'lexrank')
-                    }
                 if 'threshold' in comp_config:
                     space['lexrank_threshold'] = {
                         'type': 'float',
@@ -317,22 +333,6 @@ class UnifiedSearchSpaceExtractor:
                         'type': 'int',
                         'values': comp_config['max_iterations'],
                         'condition': ('passage_compressor_config', 'equals', 'lexrank')
-                    }
-            
-            elif method == 'spacy':
-                if 'compression_ratio' in comp_config:
-                    space['spacy_compression_ratio'] = {
-                        'type': 'float',
-                        'values': comp_config['compression_ratio'],
-                        'condition': ('passage_compressor_config', 'contains', 'spacy')
-                    }
-            
-            elif method in ['sentence_rank', 'keyword_extraction', 'query_focused']:
-                if 'compression_ratio' in comp_config:
-                    space[f'{method}_compression_ratio'] = {
-                        'type': 'float',
-                        'values': comp_config['compression_ratio'],
-                        'condition': ('passage_compressor_config', 'equals', method)
                     }
                     
     def _extract_prompt_maker_params(self, space: Dict[str, Any]):

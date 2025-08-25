@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.pipeline_executor import RAGPipelineExecutor
 from pipeline.config_manager import ConfigGenerator
 from pipeline.search_space_calculator import SearchSpaceCalculator

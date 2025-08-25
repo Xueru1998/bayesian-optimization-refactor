@@ -55,12 +55,8 @@ class UnifiedSMACRunner:
         parser.add_argument('--wandb_entity', type=str, default=None)
         parser.add_argument('--wandb_run_name', type=str, default=None)
         
-        parser.add_argument('--email_notifications', action='store_true')
-        parser.add_argument('--email_sender', type=str, default=None)
-        parser.add_argument('--email_password', type=str, default=None)
-        parser.add_argument('--email_recipients', type=str, nargs='+', default=None)
-        parser.add_argument('--smtp_server', type=str, default='smtp.gmail.com')
-        parser.add_argument('--smtp_port', type=int, default=587)
+        parser.add_argument('--email_notifications', action='store_true',
+                            help='Send email notification when experiment completes (requires EMAIL_SENDER, EMAIL_PASSWORD env vars)')
         
         parser.add_argument('--use_ragas', action='store_true', default=False,
                         help='Use RAGAS for evaluation instead of traditional metrics')
@@ -164,7 +160,7 @@ class UnifiedSMACRunner:
         from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
         
         ragas_config = self._prepare_ragas_config(args)
-        
+
         optimizer = SMACRAGOptimizer(
             config_template=config_template,
             qa_data=qa_df,
@@ -198,10 +194,10 @@ class UnifiedSMACRunner:
         )
         
         return optimizer.optimize()
-    
+
     def _run_componentwise_optimization(self, args, qa_df, corpus_df, config_template):
         from smac3.local_optimization.componentwise_smac_rag_optimizer import ComponentwiseSMACOptimizer
-        
+
         optimizer = ComponentwiseSMACOptimizer(
             config_template=config_template,
             qa_data=qa_df,
@@ -251,6 +247,7 @@ class UnifiedSMACRunner:
         print(f"\n{'='*60}")
         print(f"OPTIMIZATION MODE: {args.optimization_mode.upper()}")
         print(f"{'='*60}")
+        print(f"Using project root: {self.project_root}")
         print(f"Using config: {args.config_path}")
         print(f"Using project dir: {args.project_dir}")
         print(f"Results will be saved to: {args.result_dir}")
@@ -301,6 +298,7 @@ class UnifiedSMACRunner:
         start_time = time.time()
         
         print(f"\nStarting {args.optimization_mode} optimization...")
+        
         
         if args.optimization_mode == 'componentwise':
             if email_notifier:
@@ -375,7 +373,7 @@ class UnifiedSMACRunner:
                 best_results = wrapper.run_with_notification(experiment_name=experiment_name)
             else:
                 best_results = self._run_global_optimization(args, qa_df, corpus_df, config_template)
-        
+                
         end_time = time.time()
         total_time = end_time - start_time
         hours, remainder = divmod(total_time, 3600)
@@ -408,33 +406,22 @@ class UnifiedSMACRunner:
         return 0
     
     def _setup_email_notifier(self, args) -> Optional[ExperimentEmailNotifier]:
-        sender_email = args.email_sender or os.environ.get('EMAIL_SENDER')
-        sender_password = args.email_password or os.environ.get('EMAIL_PASSWORD')
-        
-        if not sender_email or not sender_password:
-            print("\nEmail notifications requested but credentials not provided!")
-            return None
-        
-        recipient_emails = args.email_recipients
-        if not recipient_emails:
-            recipient = os.environ.get('EMAIL_RECIPIENT', sender_email)
-            recipient_emails = [recipient]
-        
         try:
-            notifier = ExperimentEmailNotifier(
-                smtp_server=args.smtp_server,
-                smtp_port=args.smtp_port,
-                sender_email=sender_email,
-                sender_password=sender_password,
-                recipient_emails=recipient_emails,
-                use_env_vars=False
-            )
-            print(f"\nEmail notifications enabled. Will send to: {', '.join(recipient_emails)}")
+            notifier = ExperimentEmailNotifier()
+            print(f"\nEmail notifications enabled. Will send to: {', '.join(notifier.recipient_emails)}")
             return notifier
-        except Exception as e:
-            print(f"\nFailed to setup email notifier: {e}")
+        except ValueError as e:
+            print(f"\nWARNING: Email notification setup failed: {e}")
             print("Continuing without email notifications...")
-            return None
+            print("\nTo enable email notifications, set these environment variables:")
+            print("  EMAIL_SENDER='your.email@gmail.com'")
+            print("  EMAIL_PASSWORD='your-app-password'")
+            print("  EMAIL_RECIPIENTS='recipient1@example.com,recipient2@example.com' (optional)")
+            return None 
+        except Exception as e:
+            print(f"\nWARNING: Unexpected error in email notification setup: {e}")
+            print("Continuing without email notifications...")
+            return None  
     
     def _create_experiment_name(self, args) -> str:
         if args.study_name:

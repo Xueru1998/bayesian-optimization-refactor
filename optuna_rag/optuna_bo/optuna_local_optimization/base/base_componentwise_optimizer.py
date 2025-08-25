@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor

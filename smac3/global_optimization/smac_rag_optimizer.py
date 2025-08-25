@@ -17,7 +17,7 @@ from smac.facade import AbstractFacade
 from smac.callback import Callback
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from pipeline.utils import Utils
 from smac3.global_optimization.config_space_builder import SMACConfigSpaceBuilder

@@ -1,6 +1,8 @@
 import smtplib
 import ssl
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -15,32 +17,28 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
+env_path = Path(__file__).resolve().parent.parent.parent.parent / '.env'
+if env_path.exists():
+    load_dotenv(env_path, override=True)
+else:
+    load_dotenv(override=True)
 
 class ExperimentEmailNotifier:
-    def __init__(
-        self,
-        smtp_server: str = "smtp.gmail.com",
-        smtp_port: int = 587,
-        sender_email: str = None,
-        sender_password: str = None,
-        recipient_emails: List[str] = None,
-        use_env_vars: bool = True
-    ):
-        if use_env_vars:
-            self.sender_email = sender_email or os.environ.get("EMAIL_SENDER")
-            self.sender_password = sender_password or os.environ.get("EMAIL_PASSWORD")
-            default_recipient = os.environ.get("EMAIL_RECIPIENT", self.sender_email)
-            self.recipient_emails = recipient_emails or ([default_recipient] if default_recipient else [])
-        else:
-            self.sender_email = sender_email
-            self.sender_password = sender_password
-            self.recipient_emails = recipient_emails or ([sender_email] if sender_email else [])
+    def __init__(self):
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
         
-        self.smtp_server = smtp_server
-        self.smtp_port = smtp_port
+        self.sender_email = os.environ.get("EMAIL_SENDER")
+        self.sender_password = os.environ.get("EMAIL_PASSWORD")
         
         if not self.sender_email or not self.sender_password:
             raise ValueError("Email credentials not provided. Set EMAIL_SENDER and EMAIL_PASSWORD environment variables.")
+        
+        recipients_str = os.environ.get("EMAIL_RECIPIENTS", self.sender_email)
+        if recipients_str:
+            self.recipient_emails = [email.strip() for email in recipients_str.split(',')]
+        else:
+            self.recipient_emails = [self.sender_email]
     
     def send_experiment_notification(
         self,
@@ -618,13 +616,11 @@ class ExperimentNotificationWrapper:
             raise
     
     def _check_early_stopped(self, results: Dict[str, Any], threshold: float) -> bool:
-        # For component-wise optimization
         if 'component_results' in results:
             return any(
                 comp.get('best_score', 0) >= threshold 
                 for comp in results.get('component_results', {}).values()
             )
-        # For global optimization
         elif 'best_config' in results:
             return results['best_config'].get('score', 0) >= threshold
         

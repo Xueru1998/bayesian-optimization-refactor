@@ -51,7 +51,7 @@ class UnifiedOptunaRunner:
                            help='Disable Weights & Biases tracking')
         parser.add_argument('--sampler', type=str, default='tpe', 
                             choices=['tpe', 'botorch', 'random', 'grid'],
-                            help='Sampler to use for optimization (default: tpe)')
+                           help='Sampler to use for optimization (default: tpe)')
         parser.add_argument('--wandb_run_name', type=str, default=None,
                            help='Custom name for the W&B run (default: same as study_name)')
         parser.add_argument('--seed', type=int, default=42,
@@ -88,16 +88,7 @@ class UnifiedOptunaRunner:
         # Email notification arguments
         parser.add_argument('--send_email', action='store_true', default=False,
                            help='Send email notification when experiment completes')
-        parser.add_argument('--email_recipients', type=str, nargs='+', default=None,
-                           help='Email recipients (space-separated list)')
-        parser.add_argument('--email_sender', type=str, default=None,
-                           help='Email sender address (overrides environment variable)')
-        parser.add_argument('--email_password', type=str, default=None,
-                           help='Email password (overrides environment variable)')
-        parser.add_argument('--smtp_server', type=str, default="smtp.gmail.com",
-                           help='SMTP server address')
-        parser.add_argument('--smtp_port', type=int, default=587,
-                           help='SMTP server port')
+  
         
         parser.add_argument('--use_llm_compressor_evaluator', action='store_true', default=False,
                     help='Use LLM-based evaluation for passage compression (default: False)')
@@ -116,8 +107,7 @@ class UnifiedOptunaRunner:
     def _resolve_paths(self, args) -> None:
         args.config_path = Utils.get_centralized_config_path(args.config_path)
         args.project_dir = Utils.get_centralized_project_dir(args.project_dir)
-        
-        # Set default result directory based on mode
+
         if args.result_dir is None:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             if args.mode in ['componentwise', 'component-wise']:
@@ -196,12 +186,12 @@ class UnifiedOptunaRunner:
                 "description": "Simple baseline for comparison",
                 "best_for": "Quick exploration or baseline comparison"
             },
-            "grid": {
-                "name": "Grid Search",
+              "grid": {
+            "name": "Grid Search",
                 "description": "Exhaustive search over all parameter combinations",
                 "best_for": "Small search spaces or when complete exploration is needed",
                 "note": "Only available for component-wise optimization. Uses boundary values for ranges."
-            }
+        }
         }
         
         info = sampler_info.get(optimizer, sampler_info["tpe"])
@@ -230,7 +220,7 @@ class UnifiedOptunaRunner:
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
     
-    def _run_global_optimization(self, args, qa_df, corpus_df) -> Any:  # Changed return type
+    def _run_global_optimization(self, args, qa_df, corpus_df) -> Dict[str, Any]:
         print("\n===== Starting Global Bayesian Optimization =====")
         self._print_sampler_info(args.sampler)
         
@@ -296,8 +286,8 @@ class UnifiedOptunaRunner:
             print("      Each component will be evaluated with ALL possible combinations")
         else:
             print(f"Using {args.sampler.upper()} optimization")
-            self._print_sampler_info(args.sampler)
-            
+        self._print_sampler_info(args.sampler)
+
         config_template = self._load_config_template(args.config_path)
         use_multi_objective = True if args.mode == 'componentwise' else args.use_multi_objective
         
@@ -365,8 +355,6 @@ class UnifiedOptunaRunner:
         self._resolve_paths(args)
         
         print(f"Using optimization mode: {args.mode.upper()}")
-        print(f"Using config file: {args.config_path}")
-        print(f"Using project directory: {args.project_dir}")
         
         self._validate_project_dir(args.project_dir)
         
@@ -401,19 +389,12 @@ class UnifiedOptunaRunner:
         
         if args.send_email:
             try:
-                email_notifier = ExperimentEmailNotifier(
-                    smtp_server=args.smtp_server,
-                    smtp_port=args.smtp_port,
-                    sender_email=args.email_sender,
-                    sender_password=args.email_password,
-                    recipient_emails=args.email_recipients,
-                    use_env_vars=True
-                )
+                email_notifier = ExperimentEmailNotifier()
                 
                 wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
                 
                 print("\n Email notifications enabled")
-                print(f"Recipients: {args.email_recipients or 'Using environment defaults'}")
+                print("Recipients: Using environment defaults")  
                 
                 best_results = wrapper.run_with_notification(experiment_name=experiment_name)
                 
@@ -475,12 +456,6 @@ class UnifiedOptunaRunner:
                 print(f"\nBest configuration by score:")
                 print(f"  Score: {best_results['best_score']:.4f}")
                 print(f"  Config: {best_results['best_score_config']}")
-            
-            if best_results.get('pareto_front'):
-                print(f"\nPareto front contains {len(best_results['pareto_front'])} solutions")
-                print("Top 3 Pareto optimal solutions:")
-                for i, solution in enumerate(best_results['pareto_front'][:3]):
-                    print(f"  {i+1}. Score: {solution['score']:.4f}, Latency: {solution['latency']:.2f}s")
         
         print(f"\nResults saved to: {args.result_dir}")
         

@@ -4,6 +4,7 @@ import time
 import argparse
 import pandas as pd
 from typing import Optional
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline.utils import Utils
 from pipeline.logging.email.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
 

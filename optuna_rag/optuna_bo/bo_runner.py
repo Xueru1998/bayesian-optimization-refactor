@@ -5,8 +5,12 @@ import argparse
 import pandas as pd
 from typing import Optional, Dict, Any
 import wandb
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from pipeline.utils import Utils
-from optuna_rag.optuna_bo.optuna_global_optimization.bo_optuna_integration import BOPipelineOptimizer
+from optuna_rag.optuna_bo.optuna_global_optimization.bo_optimizer import BOPipelineOptimizer
 from optuna_rag.optuna_bo.optuna_local_optimization.componentwise_optuna_optimizer import ComponentwiseOptunaOptimizer
 from pipeline.logging.email.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
 

@@ -69,6 +69,7 @@ class UnifiedSMACRunner:
                             choices=['context_precision', 'context_recall', 'answer_relevancy', 
                                     'faithfulness', 'factual_correctness', 'semantic_similarity'],
                             help='Specific RAGAS metrics to use (default: all)')
+        
         parser.add_argument('--use_llm_compressor_evaluator', action='store_true', default=False,
                     help='Use LLM-based evaluation for passage compression')
         parser.add_argument('--llm_evaluator_model', type=str, default='gpt-4o',

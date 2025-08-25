@@ -19,7 +19,7 @@ load_dotenv()
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor
 from optuna_rag.optuna_bo.optuna_global_optimization.objective import OptunaObjective

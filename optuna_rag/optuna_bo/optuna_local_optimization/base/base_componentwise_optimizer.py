@@ -7,7 +7,7 @@ import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner
 from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
 from optuna_rag.config_extractor import OptunaConfigExtractor

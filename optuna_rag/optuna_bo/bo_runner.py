@@ -95,17 +95,7 @@ class UnifiedOptunaRunner:
         
         # Email notification arguments
         parser.add_argument('--send_email', action='store_true', default=False,
-                           help='Send email notification when experiment completes')
-        parser.add_argument('--email_recipients', type=str, nargs='+', default=None,
-                           help='Email recipients (space-separated list)')
-        parser.add_argument('--email_sender', type=str, default=None,
-                           help='Email sender address (overrides environment variable)')
-        parser.add_argument('--email_password', type=str, default=None,
-                           help='Email password (overrides environment variable)')
-        parser.add_argument('--smtp_server', type=str, default="smtp.gmail.com",
-                           help='SMTP server address')
-        parser.add_argument('--smtp_port', type=int, default=587,
-                           help='SMTP server port')
+                           help='Send email notification when experiment completes (requires EMAIL_SENDER, EMAIL_PASSWORD env vars)')
         parser.add_argument('--disable_early_stopping', action='store_true',
                     help='Disable early stopping for low-scoring components')
         
@@ -411,19 +401,12 @@ class UnifiedOptunaRunner:
         
         if args.send_email:
             try:
-                email_notifier = ExperimentEmailNotifier(
-                    smtp_server=args.smtp_server,
-                    smtp_port=args.smtp_port,
-                    sender_email=args.email_sender,
-                    sender_password=args.email_password,
-                    recipient_emails=args.email_recipients,
-                    use_env_vars=True
-                )
+                email_notifier = ExperimentEmailNotifier()
                 
                 wrapper = ExperimentNotificationWrapper(optimizer, email_notifier)
                 
                 print("\n Email notifications enabled")
-                print(f"Recipients: {args.email_recipients or 'Using environment defaults'}")
+                print(f"Recipients: {', '.join(email_notifier.recipient_emails)}")
                 
                 best_results = wrapper.run_with_notification(experiment_name=experiment_name)
                 

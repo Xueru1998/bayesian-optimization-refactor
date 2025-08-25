@@ -17,7 +17,7 @@ from smac.facade import AbstractFacade
 from smac.callback import Callback
 
 from pipeline.config_manager import ConfigGenerator
-from pipeline.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
+from pipeline.pipeline_runner.rag_pipeline_runner import RAGPipelineRunner, EarlyStoppingException
 from pipeline.search_space_calculator import CombinationCalculator
 from pipeline.utils import Utils
 from smac3.global_optimization.config_space_builder import SMACConfigSpaceBuilder
@@ -776,7 +776,7 @@ class SMACRAGOptimizer:
         initial_design = self._create_initial_design(scenario)
         
         target_function = (self.target_function_multifidelity if self.use_multi_fidelity 
-                          else self.target_function_standard)
+                        else self.target_function_standard)
         
         smac = self._create_optimizer(scenario, target_function, initial_design, [early_stopping_callback])
         

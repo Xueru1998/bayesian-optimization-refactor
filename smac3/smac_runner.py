@@ -4,9 +4,11 @@ import time
 import argparse
 import pandas as pd
 from typing import Optional
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from pipeline.utils import Utils
 from pipeline.logging.email.email_notifier import ExperimentEmailNotifier, ExperimentNotificationWrapper
-from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
+from global_optimization.smac_optimizer import SMACRAGOptimizer
 
 
 class UnifiedSMACRunner:
@@ -406,7 +408,7 @@ class UnifiedSMACRunner:
                 best_results = self._run_componentwise_optimization(args, qa_df, corpus_df, config_template)
         else:
             if email_notifier:
-                from smac3.global_optimization.smac_rag_optimizer import SMACRAGOptimizer
+                from smac3.global_optimization.smac_optimizer.smac_rag_optimizer import SMACRAGOptimizer
                 
                 use_llm_compressor_evaluator = getattr(args, 'use_llm_compressor_evaluator', False)
                 llm_compressor_config = {}

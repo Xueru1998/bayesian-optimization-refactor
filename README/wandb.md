@@ -73,3 +73,6 @@
 - Plotly-based interactive optimization history
 - Downloadable HTML files for offline analysis
 - Zoomable and hoverable data points for detailed inspection
+
+## Important Notes:
+- If there are no logs in Weights & Biases (wandb), try downgrading the wandb version to 0.20.1.

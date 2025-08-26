@@ -4,10 +4,15 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import yaml
+import tempfile
+import shutil
+import json
 from pipeline.config_manager import ConfigGenerator
 from pipeline.utils import Utils
 from pipeline.search_space_calculator import SearchSpaceCalculator
 from optuna_rag.config_extractor import OptunaConfigExtractor
+
+
 
 
 class GlobalGridSearchOptimizer:
@@ -403,8 +408,6 @@ class GlobalGridSearchOptimizer:
                 print(f"  {param}: {values[:3]} ... ({len(values)} values)")
     
     def run_trial(self, config: Dict[str, Any], trial_number: int) -> Dict[str, Any]:
-        import tempfile
-        import shutil
         from pipeline.pipeline_runner.pipeline_utils import EarlyStoppingException
         
         trial_dir = tempfile.mkdtemp(prefix=f"grid_trial_{trial_number}_")
@@ -413,6 +416,8 @@ class GlobalGridSearchOptimizer:
             start_time = time.time()
             
             complete_config = config.copy()
+            
+            complete_config['save_intermediate_results'] = True
             
             if 'query_expansion_method' in config and config['query_expansion_method'] != 'pass_query_expansion':
                 if 'retrieval_method' in complete_config and 'query_expansion_retrieval_method' not in complete_config:
@@ -522,6 +527,13 @@ class GlobalGridSearchOptimizer:
             
             score = results.get("combined_score", results.get("score", 0.0))
             
+            intermediate_results_dir = os.path.join(trial_dir, "debug_intermediate_results")
+            if os.path.exists(intermediate_results_dir):
+                save_dir = os.path.join(self.result_dir, "grid_intermediate_results", f"trial_{trial_number}")
+                os.makedirs(save_dir, exist_ok=True)
+                shutil.copytree(intermediate_results_dir, save_dir, dirs_exist_ok=True)
+                print(f"[Grid Search] Intermediate results saved to {save_dir}")
+            
             trial_result = {
                 "trial_number": trial_number,
                 "config": complete_config,
@@ -530,7 +542,8 @@ class GlobalGridSearchOptimizer:
                 "retrieval_score": results.get("retrieval_score", 0.0),
                 "generation_score": results.get("generation_score", 0.0),
                 "combined_score": score,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                "intermediate_results_path": os.path.join(self.result_dir, "grid_intermediate_results", f"trial_{trial_number}")
             }
             
             if self.use_ragas and 'ragas_mean_score' in results:
@@ -557,9 +570,57 @@ class GlobalGridSearchOptimizer:
         finally:
             if os.path.exists(trial_dir):
                 try:
-                    shutil.rmtree(trial_dir)
+                    if not complete_config.get('save_intermediate_results', True):
+                        shutil.rmtree(trial_dir)
                 except:
                     pass
+
+
+    def save_consolidated_intermediate_results(self):        
+        intermediate_dir = os.path.join(self.result_dir, "grid_intermediate_results")
+        if not os.path.exists(intermediate_dir):
+            print("No intermediate results found to consolidate")
+            return
+        
+        consolidated_data = []
+        
+        for trial_dir in sorted(os.listdir(intermediate_dir)):
+            if trial_dir.startswith("trial_"):
+                trial_number = int(trial_dir.split("_")[1])
+                trial_path = os.path.join(intermediate_dir, trial_dir)
+                
+                trial_summary = {
+                    "trial_number": trial_number,
+                    "components": {}
+                }
+                
+                for file in os.listdir(trial_path):
+                    if file.endswith("_summary.json"):
+                        component_name = file.replace("_summary.json", "")
+                        with open(os.path.join(trial_path, file), 'r') as f:
+                            summary_data = json.load(f)
+                            trial_summary["components"][component_name] = {
+                                "score": summary_data.get("score", 0.0),
+                                "execution_time": summary_data.get("execution_time", 0.0)
+                            }
+                
+                if os.path.exists(os.path.join(trial_path, "pipeline_summary.json")):
+                    with open(os.path.join(trial_path, "pipeline_summary.json"), 'r') as f:
+                        pipeline_summary = json.load(f)
+                        trial_summary["final_score"] = pipeline_summary.get("combined_score", 0.0)
+                        trial_summary["last_retrieval_component"] = pipeline_summary.get("last_retrieval_component")
+                        trial_summary["generation_score"] = pipeline_summary.get("generation_score", 0.0)
+                
+                consolidated_data.append(trial_summary)
+        
+        consolidated_df = pd.DataFrame(consolidated_data)
+        consolidated_df.to_csv(os.path.join(self.result_dir, "grid_intermediate_summary.csv"), index=False)
+        
+        with open(os.path.join(self.result_dir, "grid_intermediate_summary.json"), 'w') as f:
+            json.dump(consolidated_data, f, indent=2)
+        
+        print(f"Consolidated intermediate results saved to {self.result_dir}")
+        return consolidated_data
     
     def optimize(self) -> Dict[str, Any]:
         import os

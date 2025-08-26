@@ -59,14 +59,6 @@ node_lines:
         modules:
           - module_type: sentence_transformer_reranker
             model_name: cross-encoder/ms-marco-TinyBERT-L2-v2
-      - node_type: passage_compressor
-        strategy:
-          metrics: [retrieval_token_f1, retrieval_token_recall, retrieval_token_precision]
-          speed_threshold: 10
-        modules:
-          - module_type: refine
-            llm: openai
-            model: gpt-3.5-turbo-16k
   - node_line_name: post_retrieve_node_line
     nodes:
       - node_type: prompt_maker

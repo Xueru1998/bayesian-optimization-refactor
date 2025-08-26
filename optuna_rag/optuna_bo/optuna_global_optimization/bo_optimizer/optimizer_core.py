@@ -6,6 +6,7 @@ from typing import Dict, Any, Tuple
 
 from pipeline.utils import Utils
 from pipeline.logging.wandb import WandBLogger
+from .global_grid_search import GlobalGridSearchOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,11 @@ class OptimizerCore:
     
     def optimize(self) -> Dict[str, Any]:
         start_time = time.time()
+        
+        if self.optimizer.optimizer == 'grid':
+            grid_optimizer = GlobalGridSearchOptimizer(self.optimizer)
+            grid_optimizer.initialize()
+            return grid_optimizer.optimize()
         
         if self.optimizer.use_wandb:
             self._initialize_wandb()

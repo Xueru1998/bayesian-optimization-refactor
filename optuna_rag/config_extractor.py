@@ -127,6 +127,19 @@ class OptunaConfigExtractor:
                 self._extract_reranker_module_specific_models(unified_space, bo_space)
             
             return bo_space
+        
+    def extract_grid_search_space(self) -> Dict[str, List[Any]]:
+        unified_space = self.unified_extractor._extract_unified_space()
+        grid_space = {}
+        
+        for param_name, param_info in unified_space.items():
+            param_type = param_info.get('type')
+            values = param_info.get('values', [])
+            
+            if values:
+                grid_space[param_name] = values
+        
+        return grid_space
     
     def _ensure_list(self, value):
         if value is None:

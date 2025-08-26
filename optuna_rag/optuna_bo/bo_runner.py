@@ -190,12 +190,12 @@ class UnifiedOptunaRunner:
                 "description": "Simple baseline for comparison",
                 "best_for": "Quick exploration or baseline comparison"
             },
-              "grid": {
-            "name": "Grid Search",
+            "grid": {
+                "name": "Grid Search",
                 "description": "Exhaustive search over all parameter combinations",
-                "best_for": "Small search spaces or when complete exploration is needed",
-                "note": "Only available for component-wise optimization. Uses boundary values for ranges."
-        }
+                "best_for": "Complete exploration when search space is manageable",
+                "note": "Available for both global and component-wise optimization"
+            }
         }
         
         info = sampler_info.get(optimizer, sampler_info["tpe"])
@@ -211,11 +211,12 @@ class UnifiedOptunaRunner:
                 print("ERROR: RAGAS evaluation is not supported in component-wise mode")
                 print("Component-wise optimization evaluates each component separately")
                 return False
-
-        if args.sampler == 'grid' and args.mode not in ['componentwise', 'component-wise']:
-            print("ERROR: Grid search is only supported in component-wise mode")
-            print("For global optimization, please use 'tpe', 'botorch', or 'random'")
-            return False
+        
+        if args.sampler == 'grid':
+            if args.mode == 'global':
+                if not args.n_trials:
+                    print("WARNING: Grid search in global mode may generate many combinations")
+                    print("Consider setting --n_trials to limit the search space")
         
         return True
     
@@ -225,61 +226,110 @@ class UnifiedOptunaRunner:
             return yaml.safe_load(f)
     
     def _run_global_optimization(self, args, qa_df, corpus_df) -> Dict[str, Any]:
-        print("\n===== Starting Global Bayesian Optimization =====")
-        self._print_sampler_info(args.sampler)
+        if args.sampler == 'grid':
+            print("\n===== Starting Global Grid Search Optimization =====")
+            from optuna_rag.optuna_bo.optuna_global_optimization.bo_optimizer.global_grid_search import GlobalGridSearchOptimizer
+            
+            ragas_metrics = None
+            if args.use_ragas and args.ragas_metrics:
+                retrieval_metrics = [m for m in args.ragas_metrics if m in ['context_precision', 'context_recall']]
+                generation_metrics = [m for m in args.ragas_metrics if m in ['answer_relevancy', 'faithfulness', 
+                                                                            'factual_correctness', 'semantic_similarity']]
+                ragas_metrics = {
+                    'retrieval': retrieval_metrics,
+                    'generation': generation_metrics
+                }
+            
+            if args.use_ragas:
+                print("RAGAS evaluation enabled")
+            
+            wandb_run_name = args.wandb_run_name or args.study_name
+            if not wandb_run_name:
+                wandb_run_name = f"grid_search_global_{int(time.time())}"
+            
+            optimizer = GlobalGridSearchOptimizer(
+                config_path=args.config_path,
+                qa_df=qa_df,
+                corpus_df=corpus_df,
+                project_dir=args.project_dir,
+                sample_percentage=args.sample_percentage,
+                cpu_per_trial=args.cpu_per_trial,
+                retrieval_weight=args.retrieval_weight,
+                generation_weight=args.generation_weight,
+                use_cached_embeddings=args.use_cached_embeddings,
+                result_dir=args.result_dir,
+                study_name=args.study_name,
+                use_wandb=not args.no_wandb,
+                wandb_project=self.wandb_project_global,
+                wandb_entity=self.wandb_entity,
+                wandb_run_name=wandb_run_name,
+                use_ragas=args.use_ragas,
+                ragas_llm_model=args.ragas_llm_model,
+                ragas_embedding_model=args.ragas_embedding_model,
+                ragas_metrics=ragas_metrics,
+                use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
+                llm_evaluator_model=args.llm_evaluator_model,
+                max_trials=args.n_trials
+            )
+            
+            return optimizer
         
-        ragas_metrics = None
-        if args.use_ragas and args.ragas_metrics:
-            retrieval_metrics = [m for m in args.ragas_metrics if m in ['context_precision', 'context_recall']]
-            generation_metrics = [m for m in args.ragas_metrics if m in ['answer_relevancy', 'faithfulness', 
-                                                                        'factual_correctness', 'semantic_similarity']]
-            ragas_metrics = {
-                'retrieval': retrieval_metrics,
-                'generation': generation_metrics
-            }
-        
-        if args.use_ragas:
-            print("RAGAS evaluation enabled")
-        
-        wandb_run_name = args.wandb_run_name or args.study_name
-        if not wandb_run_name:
-            wandb_run_name = f"bo_{args.sampler}_{int(time.time())}"
-        
-        optimizer = BOPipelineOptimizer(
-            config_path=args.config_path,
-            qa_df=qa_df,
-            corpus_df=corpus_df,
-            project_dir=args.project_dir,
-            n_trials=args.n_trials,
-            sample_percentage=args.sample_percentage,
-            cpu_per_trial=args.cpu_per_trial,
-            retrieval_weight=args.retrieval_weight,
-            generation_weight=args.generation_weight,
-            use_cached_embeddings=args.use_cached_embeddings,
-            result_dir=args.result_dir,
-            study_name=args.study_name,
-            continue_study=False,
-            use_wandb=not args.no_wandb,
-            wandb_project=self.wandb_project_global,
-            wandb_entity=self.wandb_entity,
-            wandb_run_name=wandb_run_name,
-            optimizer=args.sampler,
-            early_stopping_threshold=args.early_stopping_threshold,
-            use_ragas=args.use_ragas,
-            ragas_llm_model=args.ragas_llm_model,
-            ragas_embedding_model=args.ragas_embedding_model,
-            ragas_metrics=ragas_metrics,
-            use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
-            llm_evaluator_model=args.llm_evaluator_model
-        )
-        
-        if args.n_trials:
-            print(f"\nStarting optimization with {args.n_trials} trials (user-specified)...")
         else:
-            print(f"\nStarting optimization with auto-calculated number of trials...")
-            print(f"Sample percentage: {args.sample_percentage * 100}% of search space")
-        
-        return optimizer
+            print("\n===== Starting Global Bayesian Optimization =====")
+            self._print_sampler_info(args.sampler)
+            
+            ragas_metrics = None
+            if args.use_ragas and args.ragas_metrics:
+                retrieval_metrics = [m for m in args.ragas_metrics if m in ['context_precision', 'context_recall']]
+                generation_metrics = [m for m in args.ragas_metrics if m in ['answer_relevancy', 'faithfulness', 
+                                                                            'factual_correctness', 'semantic_similarity']]
+                ragas_metrics = {
+                    'retrieval': retrieval_metrics,
+                    'generation': generation_metrics
+                }
+            
+            if args.use_ragas:
+                print("RAGAS evaluation enabled")
+            
+            wandb_run_name = args.wandb_run_name or args.study_name
+            if not wandb_run_name:
+                wandb_run_name = f"bo_{args.sampler}_{int(time.time())}"
+            
+            optimizer = BOPipelineOptimizer(
+                config_path=args.config_path,
+                qa_df=qa_df,
+                corpus_df=corpus_df,
+                project_dir=args.project_dir,
+                n_trials=args.n_trials,
+                sample_percentage=args.sample_percentage,
+                cpu_per_trial=args.cpu_per_trial,
+                retrieval_weight=args.retrieval_weight,
+                generation_weight=args.generation_weight,
+                use_cached_embeddings=args.use_cached_embeddings,
+                result_dir=args.result_dir,
+                study_name=args.study_name,
+                continue_study=False,
+                use_wandb=not args.no_wandb,
+                wandb_project=self.wandb_project_global,
+                wandb_entity=self.wandb_entity,
+                wandb_run_name=wandb_run_name,
+                optimizer=args.sampler,
+                early_stopping_threshold=args.early_stopping_threshold,
+                use_ragas=args.use_ragas,
+                ragas_llm_model=args.ragas_llm_model,
+                ragas_embedding_model=args.ragas_embedding_model,
+                ragas_metrics=ragas_metrics,
+                use_llm_compressor_evaluator=args.use_llm_compressor_evaluator,
+                llm_evaluator_model=args.llm_evaluator_model
+            )
+            
+            if args.n_trials:
+                print(f"\nStarting optimization with {args.n_trials} trials (user-specified)...")
+            else:
+                print(f"\nStarting optimization with auto-calculated number of trials...")
+                print(f"Sample percentage: {args.sample_percentage * 100}% of search space")
+            
+            return optimizer
     
     
     def _run_componentwise_optimization(self, args, qa_df, corpus_df) -> ComponentwiseOptunaOptimizer:

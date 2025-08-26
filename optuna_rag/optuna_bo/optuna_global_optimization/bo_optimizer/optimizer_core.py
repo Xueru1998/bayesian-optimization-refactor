@@ -2,7 +2,7 @@ import time
 import optuna
 import wandb
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from pipeline.utils import Utils
 from pipeline.logging.wandb import WandBLogger
@@ -15,6 +15,42 @@ class OptimizerCore:
         self.optimizer = optimizer
     
     def optimize(self) -> Dict[str, Any]:
+        if self.optimizer.optimizer == "grid":
+            return self._run_grid_search()
+        else:
+            return self._run_bayesian_optimization()
+
+    def _run_grid_search(self) -> Dict[str, Any]:
+        from global_grid_search import GlobalGridSearchOptimizer
+        
+        grid_optimizer = GlobalGridSearchOptimizer(
+            config_path=self.optimizer.config_path,
+            qa_df=self.optimizer.qa_df,
+            corpus_df=self.optimizer.corpus_df,
+            project_dir=self.optimizer.project_dir,
+            sample_percentage=self.optimizer.sample_percentage,
+            cpu_per_trial=self.optimizer.cpu_per_trial,
+            retrieval_weight=self.optimizer.retrieval_weight,
+            generation_weight=self.optimizer.generation_weight,
+            use_cached_embeddings=self.optimizer.use_cached_embeddings,
+            result_dir=self.optimizer.result_dir,
+            study_name=self.optimizer.study_name,
+            use_wandb=self.optimizer.use_wandb,
+            wandb_project=self.optimizer.wandb_project,
+            wandb_entity=self.optimizer.wandb_entity,
+            wandb_run_name=self.optimizer.wandb_run_name,
+            use_ragas=self.optimizer.use_ragas,
+            ragas_llm_model=self.optimizer.ragas_llm_model,
+            ragas_embedding_model=self.optimizer.ragas_embedding_model,
+            ragas_metrics=self.optimizer.ragas_metrics,
+            use_llm_compressor_evaluator=self.optimizer.use_llm_compressor_evaluator,
+            llm_evaluator_model=self.optimizer.llm_evaluator_model,
+            max_trials=self.optimizer.n_trials
+        )
+        
+        return grid_optimizer.optimize()
+
+    def _run_bayesian_optimization(self) -> Dict[str, Any]:
         start_time = time.time()
         
         if self.optimizer.use_wandb:
@@ -86,9 +122,11 @@ class OptimizerCore:
             else:
                 search_space_filtered[param_name] = str(param_value)
         
+        optimizer_type = "GRID" if self.optimizer.optimizer == "grid" else f"BO-{self.optimizer.optimizer.upper()}"
+        
         wandb_config = {
-            "search_type": f"bayesian_optimization_{self.optimizer.optimizer}",
-            "optimizer": f"BO-{self.optimizer.optimizer.upper()}",
+            "search_type": "grid_search" if self.optimizer.optimizer == "grid" else f"bayesian_optimization_{self.optimizer.optimizer}",
+            "optimizer": optimizer_type,
             "n_trials": self.optimizer.n_trials,
             "retrieval_weight": self.optimizer.retrieval_weight,
             "generation_weight": self.optimizer.generation_weight,
@@ -100,8 +138,8 @@ class OptimizerCore:
             "ragas_llm_model": self.optimizer.ragas_llm_model if self.optimizer.use_ragas else None,
             "ragas_embedding_model": self.optimizer.ragas_embedding_model if self.optimizer.use_ragas else None,
             "ragas_metrics": self.optimizer.ragas_metrics if self.optimizer.use_ragas else None,
-            "component_early_stopping_enabled": self.optimizer.component_early_stopping_enabled,
-            "component_early_stopping_thresholds": self.optimizer.component_early_stopping_thresholds if self.optimizer.component_early_stopping_enabled else None
+            "component_early_stopping_enabled": self.optimizer.component_early_stopping_enabled if self.optimizer.optimizer != "grid" else False,
+            "component_early_stopping_thresholds": self.optimizer.component_early_stopping_thresholds if self.optimizer.component_early_stopping_enabled and self.optimizer.optimizer != "grid" else None
         }
         
         wandb.init(
@@ -157,6 +195,12 @@ class OptimizerCore:
             sampler = RandomSampler(seed=42)
             print("Using Random sampler")
             
+        elif self.optimizer.optimizer == "grid":
+            from optuna.samplers import GridSampler
+            grid_values = self._get_grid_values_from_search_space()
+            sampler = GridSampler(search_space=grid_values)
+            print("Using Grid sampler")
+            
         else:
             from optuna.samplers import TPESampler
             sampler = TPESampler(
@@ -170,6 +214,24 @@ class OptimizerCore:
             print(f"Unknown sampler type '{self.optimizer.optimizer}', using TPE as default")
         
         return sampler
+    
+    def _get_grid_values_from_search_space(self) -> Dict[str, List[Any]]:
+        grid_values = {}
+        
+        for param_name, param_spec in self.optimizer.search_space.items():
+            if isinstance(param_spec, list):
+                grid_values[param_name] = param_spec
+            elif isinstance(param_spec, tuple) and len(param_spec) == 2:
+                min_val, max_val = param_spec
+                if isinstance(min_val, int):
+                    step = max(1, (max_val - min_val) // 5)
+                    grid_values[param_name] = list(range(min_val, max_val + 1, step))
+                else:
+                    grid_values[param_name] = [min_val, (min_val + max_val) / 2, max_val]
+            else:
+                grid_values[param_name] = [param_spec]
+        
+        return grid_values
     
     def _log_wandb_results(self, study):
         print("\nGenerating Optuna visualization plots for W&B...")
@@ -200,12 +262,12 @@ class OptimizerCore:
             "n_trials": len(self.optimizer.all_trials),
             "early_stopped_trials": early_stopped_count,
             "completed_trials": len(self.optimizer.all_trials) - early_stopped_count,
-            "early_stopped": self.optimizer.optimizer != "random" and early_stopping.should_stop,
+            "early_stopped": self.optimizer.optimizer not in ["random", "grid"] and early_stopping.should_stop,
             "optimizer": self.optimizer.optimizer,
             "total_trials": len(self.optimizer.all_trials),
             "all_trials": self.optimizer.all_trials,
-            "component_early_stopping_enabled": self.optimizer.component_early_stopping_enabled,
-            "component_early_stopping_thresholds": self.optimizer.component_early_stopping_thresholds if self.optimizer.component_early_stopping_enabled else None
+            "component_early_stopping_enabled": self.optimizer.component_early_stopping_enabled if self.optimizer.optimizer != "grid" else False,
+            "component_early_stopping_thresholds": self.optimizer.component_early_stopping_thresholds if self.optimizer.component_early_stopping_enabled and self.optimizer.optimizer != "grid" else None
         }
 
         if best_config:
